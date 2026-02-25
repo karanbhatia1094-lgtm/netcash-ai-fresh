@@ -1,0 +1,22 @@
+# Production Shopify app config template
+# Copy and fill values from Shopify Partner Dashboard before deploy.
+
+client_id = "REPLACE_WITH_PARTNER_APP_CLIENT_ID"
+name = "netcash-ai-fresh"
+application_url = "https://app.netcash.ai"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = false
+include_config_on_deploy = true
+
+[webhooks]
+api_version = "2026-04"
+
+[access_scopes]
+scopes = "read_orders,read_customers,read_products,write_products"
+optional_scopes = []
+use_legacy_install_flow = false
+
+[auth]
+redirect_urls = ["https://app.netcash.ai/auth/callback"]

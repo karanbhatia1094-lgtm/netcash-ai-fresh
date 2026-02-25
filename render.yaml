@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: netcash-web
+    env: node
+    plan: starter
+    autoDeploy: true
+    buildCommand: npm ci && npm run build:prod
+    preDeployCommand: npm run prisma:push:prod && BOOTSTRAP_RUN_DB_PUSH=true npm run check:prod-bootstrap
+    startCommand: npm run start:prod
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_PROVIDER
+        value: postgresql
+      - key: SHOPIFY_DISTRIBUTION
+        value: app_store
+
+  - type: worker
+    name: netcash-worker
+    env: node
+    plan: starter
+    autoDeploy: true
+    buildCommand: npm ci
+    startCommand: npm run worker:loop
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_PROVIDER
+        value: postgresql

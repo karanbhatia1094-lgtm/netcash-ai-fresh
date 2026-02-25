@@ -1,0 +1,438 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
+// enough when changing adapters.
+// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
+datasource db {
+  provider = "sqlite"
+}
+
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+model NetCashOrder {
+  id              String   @id @default(uuid())
+  orderId         String   @unique
+  shop            String   // Store domain to separate data
+  orderNumber     String
+  createdAt       DateTime
+  grossValue      Float    // Original order value
+  discountTotal   Float    @default(0)
+  shippingTotal   Float    @default(0)
+  taxTotal        Float    @default(0)
+  refundTotal     Float    @default(0)
+  returnTotal     Float    @default(0)
+  rtoTotal        Float    @default(0)  // RTO losses
+  exchangeAdjustment Float @default(0)  // Price difference for exchanges
+  netCash         Float    // Final amount to bank
+  financialStatus String?  // paid, refunded, etc.
+  fulfillmentStatus String? // fulfilled, partial, etc.
+  marketingSource String?  // meta, google, etc.
+  campaignId      String?
+  campaignName    String?
+  utmSource       String?
+  utmMedium       String?
+  utmCampaign     String?
+  clickId         String?
+  landingSite     String?
+  referringSite   String?
+  customerName    String?
+  customerEmail   String?
+  customerPhone   String?
+  shippingAddress1 String?
+  shippingAddress2 String?
+  shippingCity    String?
+  shippingPincode String?
+  shippingState   String?
+  shippingCountry String?
+  firstClickSource String?
+  firstClickCampaignId String?
+  firstClickCampaignName String?
+  lastClickSource String?
+  lastClickCampaignId String?
+  lastClickCampaignName String?
+  touchpointsJson String?
+  isReturned      Boolean  @default(false)
+  isRTO           Boolean  @default(false)
+  updatedAt       DateTime @updatedAt
+  lineItems       OrderLineItem[]
+  toolAttributions ToolAttribution[]
+
+  @@unique([shop, orderNumber])
+}
+
+model OrderLineItem {
+  id             Int          @id @default(autoincrement())
+  netCashOrderId String
+  title          String
+  variantTitle   String?
+  sku            String?
+  quantity       Int          @default(1)
+  unitPrice      Float        @default(0)
+  lineTotal      Float        @default(0)
+  netCashOrder   NetCashOrder @relation(fields: [netCashOrderId], references: [id], onDelete: Cascade)
+}
+
+model ToolAttribution {
+  id             Int          @id @default(autoincrement())
+  netCashOrderId String
+  tool           String
+  campaignId     String?
+  campaignName   String?
+  adSetId        String?
+  adId           String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  netCashOrder   NetCashOrder @relation(fields: [netCashOrderId], references: [id], onDelete: Cascade)
+
+  @@unique([netCashOrderId, tool])
+}
+
+model MarketingSourceMetrics {
+  id                  Int      @id @default(autoincrement())
+  source              String   @unique
+  reportedROAS        Float    @default(0)
+  adSpend             Float    @default(0)
+  reportedRevenue     Float    @default(0)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+}
+
+model MarketingSpendEntry {
+  id        Int      @id @default(autoincrement())
+  source    String
+  spendDate DateTime
+  adSpend   Float    @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([source, spendDate])
+  @@index([spendDate])
+}
+
+model ConnectorCredential {
+  id           Int      @id @default(autoincrement())
+  shop         String
+  provider     String
+  accountId    String?
+  accountName  String?
+  accessToken  String?
+  refreshToken String?
+  tokenType    String?
+  scope        String?
+  expiresAt    DateTime?
+  metadata     String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([shop, provider])
+  @@index([shop])
+}
+
+model ConnectorSyncRun {
+  id                     Int      @id @default(autoincrement())
+  shop                   String
+  provider               String
+  status                 String
+  lookbackDays           Int      @default(7)
+  spendRowsFetched       Int      @default(0)
+  spendRowsWritten       Int      @default(0)
+  attributionRowsFetched Int      @default(0)
+  attributionRowsWritten Int      @default(0)
+  errorMessage           String?
+  durationMs             Int      @default(0)
+  createdAt              DateTime @default(now())
+
+  @@index([shop, createdAt])
+  @@index([provider, createdAt])
+}
+
+model AlertRuleSetting {
+  id         Int      @id @default(autoincrement())
+  shop       String
+  ruleKey    String
+  enabled    Boolean  @default(true)
+  mutedUntil DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([shop, ruleKey])
+  @@index([shop])
+}
+
+model AlertEvent {
+  id         Int      @id @default(autoincrement())
+  shop       String
+  ruleKey    String
+  severity   String
+  title      String
+  message    String
+  fingerprint String
+  isRead     Boolean  @default(false)
+  firstSeenAt DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+  hitCount   Int      @default(1)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([shop, fingerprint])
+  @@index([shop, isRead, severity, lastSeenAt])
+}
+
+model DashboardPreference {
+  id        Int      @id @default(autoincrement())
+  shop      String   @unique
+  layout    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model AiPromptTemplate {
+  id        Int      @id @default(autoincrement())
+  shop      String
+  title     String
+  query     String
+  category  String   @default("custom")
+  isPinned  Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  promptRuns AiPromptRun[]
+
+  @@index([shop, createdAt])
+}
+
+model AiPromptRun {
+  id          Int      @id @default(autoincrement())
+  shop        String
+  templateId  Int?
+  promptQuery String
+  intent      String?
+  answer      String?
+  summaryJson String?
+  createdAt   DateTime @default(now())
+
+  template AiPromptTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+
+  @@index([shop, createdAt])
+}
+
+model MarketBenchmark {
+  id           Int      @id @default(autoincrement())
+  benchmarkKey String
+  metric       String
+  p50          Float
+  p75          Float
+  p90          Float
+  source       String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([benchmarkKey, metric])
+}
+
+model CampaignActionItem {
+  id                Int      @id @default(autoincrement())
+  shop              String
+  source            String
+  campaignId        String?
+  campaignName      String?
+  priority          String   @default("medium")
+  reason            String
+  recommendedAction String
+  status            String   @default("open")
+  owner             String?
+  dueDate           DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([shop, status, priority, createdAt])
+}
+
+model ActivationDestination {
+  id              Int      @id @default(autoincrement())
+  shop            String
+  name            String
+  endpointUrl     String
+  authHeaderName  String?
+  authHeaderValue String?
+  isActive        Boolean  @default(true)
+  lastStatus      String?
+  lastResponse    String?
+  lastTriggeredAt DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([shop, isActive])
+}
+
+model AudienceSyncRule {
+  id            Int      @id @default(autoincrement())
+  shop          String
+  name          String
+  audienceName  String
+  destinationId Int
+  metric        String
+  comparator    String
+  threshold     Float
+  source        String?
+  isActive      Boolean  @default(true)
+  lastRunAt     DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([shop, isActive, createdAt])
+}
+
+model AudienceSyncRun {
+  id            Int      @id @default(autoincrement())
+  shop          String
+  ruleId        Int
+  status        String
+  metricValue   Float?
+  matchedCount  Int      @default(0)
+  payload       String?
+  response      String?
+  errorMessage  String?
+  createdAt     DateTime @default(now())
+
+  @@index([shop, createdAt])
+  @@index([ruleId, createdAt])
+}
+
+model BudgetReallocationDecision {
+  id               Int      @id @default(autoincrement())
+  shop             String
+  fromSource       String
+  fromCampaignId   String?
+  fromCampaignName String?
+  toSource         String
+  toCampaignId     String?
+  toCampaignName   String?
+  shiftPercent     Float
+  reason           String
+  status           String   @default("approved")
+  approvedBy       String?
+  createdAt        DateTime @default(now())
+
+  @@index([shop, createdAt])
+}
+
+model UniversalIdentity {
+  id           Int      @id @default(autoincrement())
+  identityKey  String   @unique
+  identityType String
+  identityHash String
+  firstSeenAt  DateTime @default(now())
+  lastSeenAt   DateTime @default(now())
+  eventsCount  Int      @default(0)
+  shopsCount   Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([identityType, identityHash])
+  @@index([lastSeenAt])
+}
+
+model UniversalIdentityShop {
+  id               Int      @id @default(autoincrement())
+  identityKey      String
+  shop             String
+  firstSeenAt      DateTime @default(now())
+  lastSeenAt       DateTime @default(now())
+  eventsCount      Int      @default(0)
+  totalOrders      Int      @default(0)
+  totalGrossValue  Float    @default(0)
+  totalNetCash     Float    @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([identityKey, shop])
+  @@index([shop, lastSeenAt])
+}
+
+model UniversalSignalEvent {
+  id               Int      @id @default(autoincrement())
+  shop             String
+  eventType        String
+  eventAt          DateTime
+  orderId          String?
+  orderNumber      String?
+  source           String?
+  campaignId       String?
+  campaignName     String?
+  identityKey      String?
+  customerEmailHash String?
+  customerPhoneHash String?
+  clickIdHash      String?
+  sessionId        String?
+  paymentMethod    String?
+  couponCode       String?
+  discountAmount   Float?
+  grossValue       Float?
+  netCash          Float?
+  messageChannel   String?
+  messageOpenedAt  DateTime?
+  adSeenAt         DateTime?
+  purchaseAt       DateTime?
+  deviceType       String?
+  osName           String?
+  handsetBrand     String?
+  handsetModel     String?
+  metadataJson     String?
+  createdAt        DateTime @default(now())
+
+  @@index([shop, eventAt])
+  @@index([shop, eventType, eventAt])
+  @@index([identityKey, eventAt])
+}
+
+model UniversalCustomerProfile {
+  id                  Int      @id @default(autoincrement())
+  shop                String
+  identityKey         String
+  customerEmailHash   String?
+  customerPhoneHash   String?
+  firstSeenAt         DateTime @default(now())
+  lastSeenAt          DateTime @default(now())
+  totalOrders         Int      @default(0)
+  totalGrossValue     Float    @default(0)
+  totalDiscountAmount Float    @default(0)
+  totalNetCash        Float    @default(0)
+  lastPaymentMethod   String?
+  lastCouponCode      String?
+  lastSource          String?
+  lastCampaignId      String?
+  lastCampaignName    String?
+  lastOsName          String?
+  lastHandsetBrand    String?
+  lastHandsetModel    String?
+  lastDeviceType      String?
+  updatedAt           DateTime @updatedAt
+  createdAt           DateTime @default(now())
+
+  @@unique([shop, identityKey])
+  @@index([shop, totalNetCash])
+  @@index([identityKey, lastSeenAt])
+}

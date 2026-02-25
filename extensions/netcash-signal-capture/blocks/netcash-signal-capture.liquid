@@ -1,0 +1,14 @@
+{% comment %}
+  Netcash.ai storefront signal capture embed.
+  Enables first-party capture of UTM + click IDs into cart attributes.
+{% endcomment %}
+
+<script src="{{ 'netcash-storefront-signal.js' | asset_url }}" defer></script>
+
+{% schema %}
+{
+  "name": "Netcash.ai Signal Capture",
+  "target": "body",
+  "settings": []
+}
+{% endschema %}

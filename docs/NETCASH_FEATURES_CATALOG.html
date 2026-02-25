@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Netcash.ai Feature Catalog</title>
+  <style>
+    :root {
+      --bg: #f4f8ff;
+      --card: #ffffff;
+      --text: #102844;
+      --muted: #496487;
+      --line: #cbdaf0;
+      --brand: #1f4ed8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Aptos", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 28px;
+    }
+    .wrap {
+      max-width: 1100px;
+      margin: 0 auto;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 24px;
+    }
+    h1, h2 { margin: 0 0 10px; }
+    h1 { font-size: 30px; }
+    h2 { font-size: 20px; margin-top: 22px; }
+    .meta {
+      color: var(--muted);
+      font-size: 14px;
+      margin-bottom: 12px;
+    }
+    p { margin: 0 0 10px; line-height: 1.45; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      font-size: 13px;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      vertical-align: top;
+      padding: 10px;
+      line-height: 1.4;
+    }
+    th {
+      background: #edf4ff;
+      color: #143a67;
+      text-align: left;
+      font-size: 12px;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+    .note {
+      border-left: 4px solid var(--brand);
+      background: #eef4ff;
+      color: #23486f;
+      padding: 10px 12px;
+      border-radius: 6px;
+      margin-top: 16px;
+      font-size: 13px;
+    }
+    @media print {
+      body { padding: 0; background: #fff; }
+      .wrap { border: 0; border-radius: 0; padding: 10px; max-width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Netcash.ai Feature Catalog</h1>
+    <div class="meta">Generated: February 21, 2026 | Scope: Shopify embedded app features + operational capabilities</div>
+    <p>This document explains each major feature, what it enables for merchants/teams, and why it is necessary for profitable growth decisions.</p>
+
+    <h2>Core Product Features</h2>
+    <table>
+      <thead>
+        <tr>
+          <th style="width: 26%">Feature</th>
+          <th style="width: 37%">What It Enables</th>
+          <th style="width: 37%">Why It Is Necessary</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Embedded Shopify App Shell</td><td>Operate inside Shopify Admin without switching tools.</td><td>Reduces friction and improves daily adoption for brand teams.</td></tr>
+        <tr><td>Founder Dashboard (Net Cash + Real ROAS)</td><td>Single snapshot of profitability and growth efficiency.</td><td>Platform ROAS alone can hide return/refund/cost impact.</td></tr>
+        <tr><td>Health Score + Why Changed</td><td>Quick diagnosis of KPI movement and data quality shifts.</td><td>Teams need root-cause direction, not only metric values.</td></tr>
+        <tr><td>Customer Intelligence + 360 View</td><td>High-value cohorts, repeat behavior, risk items/pincodes.</td><td>Customer-level actions improve retention and margin quality.</td></tr>
+        <tr><td>Campaign Performance</td><td>Source/campaign level net cash, ROAS, real ROAS analysis.</td><td>Supports budget reallocation to profitable campaigns.</td></tr>
+        <tr><td>Stop-Campaign Recommendations</td><td>Find underperforming spend candidates fast.</td><td>Prevents waste and protects cash efficiency.</td></tr>
+        <tr><td>Alerts Center</td><td>Anomaly/risk detection for operational and marketing issues.</td><td>Early warnings reduce delayed reaction losses.</td></tr>
+        <tr><td>Attribution Models</td><td>First-click, last-click, linear, and time-decay views.</td><td>Single-touch attribution can mislead channel decisions.</td></tr>
+        <tr><td>Incrementality Module</td><td>Paid-vs-baseline signal for uplift understanding.</td><td>Helps avoid over-crediting channels with weak incrementality.</td></tr>
+        <tr><td>Spend Ingestion (Manual + Connectors)</td><td>Maintains denominator integrity for ROAS calculations.</td><td>Without spend quality, profitability metrics are unreliable.</td></tr>
+        <tr><td>Connector Hub + OAuth</td><td>Meta/Google and other tool connections with sync controls.</td><td>Automates data collection and improves coverage consistency.</td></tr>
+        <tr><td>Meta Signal-Loss Recovery</td><td>First-party click capture + server attribution fallback.</td><td>Required due to pixel/UTM loss in privacy-restricted flows.</td></tr>
+        <tr><td>Universal Insights (Premium)</td><td>Cross-store behavior graph: payment, coupon, device, time.</td><td>Supports strategic segmentation and lifecycle optimization.</td></tr>
+        <tr><td>RFM + Recency Cohorts</td><td>Segment users into action-oriented lifecycle groups.</td><td>Drives targeted retention/winback campaigns.</td></tr>
+        <tr><td>Hour/Day Purchase Pattern</td><td>Identify best purchase windows and engagement lag.</td><td>Improves timing of ads, push, and message campaigns.</td></tr>
+        <tr><td>NLP Search + Command Navigation</td><td>Natural-language route opening for major workflows.</td><td>Speeds execution for non-technical users and managers.</td></tr>
+        <tr><td>NLP Export/Download Intents</td><td>Auto-download orders/spend/customer 360 datasets.</td><td>Faster reporting and sharing with stakeholders.</td></tr>
+        <tr><td>CSV/Pack Export Actions</td><td>Download operational and analytics datasets on demand.</td><td>Needed for audits, finance reviews, and external analysis.</td></tr>
+        <tr><td>Scheduled Reports</td><td>Recurring report delivery by email.</td><td>Ensures reporting continuity without manual effort.</td></tr>
+        <tr><td>Onboarding Wizard + Diagnostics</td><td>Tracks setup progress and missing prerequisites.</td><td>Shortens time-to-value for new merchant installs.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Platform Reliability and Operations</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Capability</th>
+          <th>What It Enables</th>
+          <th>Why It Is Necessary</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Shopify Webhook Processing</td><td>Real-time order/refund/install lifecycle handling.</td><td>Keeps app data aligned with store events.</td></tr>
+        <tr><td>Health & Readiness Endpoints</td><td>Automated runtime checks for environment and DB.</td><td>Critical for production monitoring and incident response.</td></tr>
+        <tr><td>Cron-Secured Endpoints</td><td>Automated sync/report tasks with key-based protection.</td><td>Prevents unauthorized triggering of background jobs.</td></tr>
+        <tr><td>Plan Gating</td><td>Feature access control by Starter/Pro/Premium.</td><td>Supports monetization and packaging strategy.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="note">
+      Implementation note: Premium-only modules can still ingest data beforehand, allowing instant value when a merchant upgrades.
+    </div>
+  </div>
+</body>
+</html>

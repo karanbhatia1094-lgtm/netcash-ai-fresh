@@ -1,0 +1,49 @@
+substitutions:
+  _REGION: asia-south1
+  _WEB_SERVICE: netcash-web
+  _WORKER_SERVICE: netcash-worker
+  _REPO: netcash-ai
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_REPO/netcash:$COMMIT_SHA
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_REPO/netcash:$COMMIT_SHA
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - $_WEB_SERVICE
+      - --image=$_REGION-docker.pkg.dev/$PROJECT_ID/$_REPO/netcash:$COMMIT_SHA
+      - --region=$_REGION
+      - --platform=managed
+      - --allow-unauthenticated
+      - --set-env-vars=NODE_ENV=production,DATABASE_PROVIDER=postgresql,SHOPIFY_DISTRIBUTION=app_store
+      - --command=npm
+      - --args=run,start:prod
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - $_WORKER_SERVICE
+      - --image=$_REGION-docker.pkg.dev/$PROJECT_ID/$_REPO/netcash:$COMMIT_SHA
+      - --region=$_REGION
+      - --platform=managed
+      - --no-allow-unauthenticated
+      - --set-env-vars=NODE_ENV=production,DATABASE_PROVIDER=postgresql
+      - --command=npm
+      - --args=run,worker:loop
+
+images:
+  - $_REGION-docker.pkg.dev/$PROJECT_ID/$_REPO/netcash:$COMMIT_SHA

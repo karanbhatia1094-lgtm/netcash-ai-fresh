@@ -1,0 +1,26 @@
+app = "netcash-ai"
+primary_region = "sin"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  PORT = "3000"
+  DATABASE_PROVIDER = "postgresql"
+  SHOPIFY_DISTRIBUTION = "app_store"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[processes]
+  app = "npm run start:prod"
+  worker = "npm run worker:loop"
+
+[deploy]
+  release_command = "npm run prisma:push:prod && BOOTSTRAP_RUN_DB_PUSH=true npm run check:prod-bootstrap"

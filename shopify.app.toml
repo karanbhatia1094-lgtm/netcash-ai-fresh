@@ -1,0 +1,22 @@
+# Local/default Shopify app config template.
+# Keep secrets out of repo. Use Partner Dashboard and env secrets manager.
+
+client_id = "REPLACE_WITH_PARTNER_APP_CLIENT_ID"
+name = "netcash-ai-fresh"
+application_url = "http://localhost:3000"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = true
+include_config_on_deploy = true
+
+[webhooks]
+api_version = "2026-04"
+
+[access_scopes]
+scopes = "read_orders,read_customers,read_products,write_products"
+optional_scopes = []
+use_legacy_install_flow = false
+
+[auth]
+redirect_urls = ["http://localhost:3000/auth/callback"]
