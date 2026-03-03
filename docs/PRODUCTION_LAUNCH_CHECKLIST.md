@@ -16,7 +16,7 @@
 ## 1.1) Migration and Index Verification
 1. Bootstrap database on production Postgres:
    - `npm run prisma:generate:prod`
-   - `npm run prisma:push:prod`
+   - `npm run prisma:migrate:prod`
    - `npm run check:scaling`
    - `npm run check:go-no-go`
 2. Verify queue indexes exist:

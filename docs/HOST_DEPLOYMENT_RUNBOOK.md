@@ -45,7 +45,7 @@ This repo includes ready templates for:
 2. Create Cloud Run bootstrap job (one-time) named `netcash-bootstrap`:
    - image: same app image
    - command: `npm`
-   - args: `run prisma:push:prod && BOOTSTRAP_RUN_DB_PUSH=true npm run check:prod-bootstrap`
+   - args: `run prisma:migrate:prod && BOOTSTRAP_RUN_MIGRATIONS=true npm run check:prod-bootstrap`
 3. Trigger build/deploy:
    - `gcloud builds submit --config cloudbuild.yaml`
 4. Validate:

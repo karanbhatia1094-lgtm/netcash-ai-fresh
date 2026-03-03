@@ -26,6 +26,14 @@ import { enqueueJob } from "../utils/job-queue.server";
 import { isFeatureEnabledForShopAsync } from "../utils/release-control.server";
 
 const DAY_OPTIONS = [7, 30, 90, 365];
+const CUSTOMER_360_LOOKBACK_MIN_DAYS = 30;
+const CUSTOMER_360_LOOKBACK_MAX_DAYS = 730;
+
+function resolveCustomer360LookbackDays() {
+  const raw = Number(process.env.CUSTOMER_360_LOOKBACK_DAYS || 365);
+  if (!Number.isFinite(raw)) return 365;
+  return Math.max(CUSTOMER_360_LOOKBACK_MIN_DAYS, Math.min(CUSTOMER_360_LOOKBACK_MAX_DAYS, Math.floor(raw)));
+}
 
 function normalizeCustomerKey(order) {
   const email = String(order?.customerEmail || "").trim().toLowerCase();
@@ -440,7 +448,7 @@ export async function loader({ request }) {
   }
 
   const orders = await getOrders(shop, days);
-  const allOrders = await getOrders(shop, 3650);
+  const allOrders = await getOrders(shop, resolveCustomer360LookbackDays());
   const { profiles: customerProfiles, byOrderId: customerHistoryByOrderId } = buildCustomerProfilesFromOrders(allOrders);
   const sourceMetrics = await getSourceMetrics(days);
   const spendHistory = await getSpendEntries(days);

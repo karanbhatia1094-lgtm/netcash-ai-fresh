@@ -25,7 +25,7 @@
 
 ## 2) Database and build
 1. `npm run prisma:generate:prod`
-2. `npm run prisma:push:prod`
+2. `npm run prisma:migrate:prod`
 3. `npm run build`
 4. `npm run check:scaling`
 5. `npm run check:indexes`
@@ -37,7 +37,7 @@
 - `npm run check:prod-bootstrap`
 - Optional migrations inline:
   - `BOOTSTRAP_RUN_MIGRATIONS=true npm run check:prod-bootstrap`
-- Recommended first deploy bootstrap:
+- Optional first deploy bootstrap (only for non-migration bootstrap flows):
   - `BOOTSTRAP_RUN_DB_PUSH=true npm run check:prod-bootstrap`
 
 ## 4) Deploy app config to Shopify
@@ -48,7 +48,9 @@
 1. App web process:
 - `npm run start:prod`
 2. Worker process:
-- `npm run worker:loop`
+- Auto-started inside app web process when `AUTO_START_WORKER=true` (recommended).
+- Optional dedicated worker process for higher throughput:
+  - `npm run worker:loop`
 
 ## 6) Schedule recurring jobs
 1. Daily autopilot enqueue cron:

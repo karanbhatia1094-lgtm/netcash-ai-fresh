@@ -9,6 +9,7 @@ import dns from "node:dns";
 import { PrismaSessionStorage } from "@shopify/shopify-app-session-storage-prisma";
 import { prisma } from "./utils/db.server";
 import { assertProductionEnv, resolveAppUrl } from "./utils/env.server";
+import { startEmbeddedWorkerLoop } from "./utils/embedded-worker.server";
 
 assertProductionEnv();
 
@@ -61,6 +62,7 @@ function patchDnsLookupForDev() {
 }
 
 patchDnsLookupForDev();
+startEmbeddedWorkerLoop();
 
 export const BASIC_PLAN = "Basic Monthly";
 export const PRO_PLAN = "Pro Monthly";

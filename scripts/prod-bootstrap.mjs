@@ -53,7 +53,7 @@ async function main() {
 
   steps.push(["npm", ["run", "prisma:generate:prod"]]);
   if (runMigrations) {
-    steps.push(["npx", ["prisma", "migrate", "deploy"]]);
+    steps.push(["npx", ["prisma", "migrate", "deploy", "--schema", "prisma/schema.postgres.prisma"]]);
   }
   if (runDbPush) {
     steps.push(["npm", ["run", "prisma:push:prod"]]);
