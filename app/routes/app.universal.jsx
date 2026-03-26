@@ -1,4 +1,5 @@
 import { Link, useLoaderData, useRouteError, isRouteErrorResponse } from "@remix-run/react";
+import { useState } from "react";
 import { authenticate, BILLING_PLANS } from "../shopify.server";
 import { resolvePlanContext } from "../utils/plan.server";
 import { getUniversalInsights } from "../utils/db.server";
@@ -69,6 +70,8 @@ export async function loader({ request }) {
 
 export default function UniversalInsightsPage() {
   const { days, locked, insights, compare, baselineDays, baseline } = useLoaderData();
+  const [visibleHourRows, setVisibleHourRows] = useState(24);
+  const [visibleSegmentRows, setVisibleSegmentRows] = useState(8);
   const dayQuery = (nextDays) => `?days=${nextDays}${compare ? "&compare=1" : ""}`;
   const compareQuery = compare ? `?days=${days}` : `?days=${days}&compare=1`;
   const baselinePurchases = Number(baseline?.totals?.purchases || 0);
@@ -99,6 +102,14 @@ export default function UniversalInsightsPage() {
     topPayment ? `Most buyers used ${topPayment.name}; tune checkout messaging around this payment method.` : "Payment mix is still building.",
     topHandset ? `Handset concentration is highest on ${topHandset.name}; prioritize creative QA for this device.` : "Handset split is still building.",
   ];
+  const displayedHourRows = (insights?.purchaseByHour || []).slice(0, visibleHourRows);
+  const hasMoreHourRows = (insights?.purchaseByHour || []).length > displayedHourRows.length;
+  const displayedRfmRows = (insights?.rfmSegments || []).slice(0, visibleSegmentRows);
+  const hasMoreRfmRows = (insights?.rfmSegments || []).length > displayedRfmRows.length;
+  const displayedRecencyRows = (insights?.recencyBuckets || []).slice(0, visibleSegmentRows);
+  const hasMoreRecencyRows = (insights?.recencyBuckets || []).length > displayedRecencyRows.length;
+  const displayedOrderBandRows = (insights?.orderValueBands || []).slice(0, visibleSegmentRows);
+  const hasMoreOrderBandRows = (insights?.orderValueBands || []).length > displayedOrderBandRows.length;
 
   if (locked) {
     return (
@@ -343,25 +354,34 @@ export default function UniversalInsightsPage() {
           <div className="nc-soft-box">
             <strong>RFM Segments</strong>
             <ul style={{ margin: "8px 0 0", paddingLeft: "18px" }}>
-              {(insights?.rfmSegments || []).map((row) => (
+              {displayedRfmRows.map((row) => (
                 <li key={`rfm-${row.segment}`}>{row.segment}: {row.count}</li>
               ))}
+              {hasMoreRfmRows ? (
+                <li><button type="button" className="nc-chip" onClick={() => setVisibleSegmentRows((current) => current + 8)}>Load more</button></li>
+              ) : null}
             </ul>
           </div>
           <div className="nc-soft-box">
             <strong>Recency Buckets</strong>
             <ul style={{ margin: "8px 0 0", paddingLeft: "18px" }}>
-              {(insights?.recencyBuckets || []).map((row) => (
+              {displayedRecencyRows.map((row) => (
                 <li key={`rec-${row.bucket}`}>{row.bucket}: {row.count}</li>
               ))}
+              {hasMoreRecencyRows ? (
+                <li><button type="button" className="nc-chip" onClick={() => setVisibleSegmentRows((current) => current + 8)}>Load more</button></li>
+              ) : null}
             </ul>
           </div>
           <div className="nc-soft-box">
             <strong>Order Value Bands</strong>
             <ul style={{ margin: "8px 0 0", paddingLeft: "18px" }}>
-              {(insights?.orderValueBands || []).map((row) => (
+              {displayedOrderBandRows.map((row) => (
                 <li key={`aov-${row.band}`}>{row.band}: {row.count}</li>
               ))}
+              {hasMoreOrderBandRows ? (
+                <li><button type="button" className="nc-chip" onClick={() => setVisibleSegmentRows((current) => current + 8)}>Load more</button></li>
+              ) : null}
             </ul>
           </div>
           <div className="nc-soft-box">
@@ -414,7 +434,7 @@ export default function UniversalInsightsPage() {
             </tr>
           </thead>
           <tbody>
-            {(insights?.purchaseByHour || []).map((row) => {
+            {displayedHourRows.map((row) => {
               const ad = insights?.adViewsByHour?.find((x) => x.hour === row.hour)?.count || 0;
               const msg = insights?.messageOpensByHour?.find((x) => x.hour === row.hour)?.count || 0;
               return (
@@ -428,6 +448,13 @@ export default function UniversalInsightsPage() {
             })}
           </tbody>
         </table>
+        {hasMoreHourRows ? (
+          <div className="nc-toolbar" style={{ marginTop: "10px", marginBottom: 0 }}>
+            <button type="button" className="nc-chip" onClick={() => setVisibleHourRows((current) => current + 24)}>
+              Load 24 more hours
+            </button>
+          </div>
+        ) : null}
       </div>
     </div>
   );

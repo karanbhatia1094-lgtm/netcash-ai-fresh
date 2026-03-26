@@ -17,6 +17,14 @@ const PROVIDER_ALIASES = {
   "nitro engage": "nitro",
   wati: "wati",
   spur: "spur",
+  shiprocket: "shiprocket",
+  delhivery: "delhivery",
+  shipway: "shipway",
+  unicommerce: "unicommerce",
+  easycom: "easycom",
+  "returns prime": "returns_prime",
+  returnsprime: "returns_prime",
+  bluedart: "bluedart",
   manual: "manual",
 };
 
@@ -32,6 +40,13 @@ export const SUPPORTED_PROVIDERS = [
   "nitro",
   "wati",
   "spur",
+  "shiprocket",
+  "delhivery",
+  "shipway",
+  "unicommerce",
+  "easycom",
+  "returns_prime",
+  "bluedart",
   "manual",
 ];
 

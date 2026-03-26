@@ -2,6 +2,7 @@ import { addSourceAdSpend, createConnectorSyncRun, getConnectorCredential, upser
 import { normalizeProvider } from "./connectors";
 import { refreshGoogleAccessToken } from "./connector-oauth.server";
 import { logError, logInfo, logWarn } from "./logger.server";
+import { ensureDeliveryOmsTables, upsertDeliveryShipment, upsertOmsStatus } from "./delivery-oms.server";
 
 function requiredEnv(name) {
   const value = process.env[name];
@@ -140,19 +141,121 @@ async function syncGoogleAdsSpend({ days, shop }) {
   };
 }
 
+function normalizeGenericConfig(metadata = {}, providerKey) {
+  const upper = String(providerKey || "").toUpperCase();
+  const baseUrl = metadata.baseUrl || process.env[`${upper}_API_BASE`] || "";
+  const endpoint = metadata.endpoint || process.env[`${upper}_API_ENDPOINT`] || "";
+  const apiKey = metadata.apiKey || process.env[`${upper}_API_KEY`] || "";
+  const authHeaderName = metadata.authHeaderName || "Authorization";
+  const authPrefix = metadata.authPrefix || "Bearer";
+  const kind = metadata.kind || metadata.category || "delivery";
+  return {
+    baseUrl: String(baseUrl || "").trim(),
+    endpoint: String(endpoint || "").trim(),
+    apiKey: String(apiKey || "").trim(),
+    authHeaderName: String(authHeaderName || "").trim() || "Authorization",
+    authPrefix: String(authPrefix || "").trim(),
+    kind: String(kind || "").trim().toLowerCase(),
+  };
+}
+
+function buildGenericUrl(baseUrl, endpoint) {
+  if (!endpoint) return baseUrl;
+  if (endpoint.startsWith("http")) return endpoint;
+  if (!baseUrl) return endpoint;
+  return `${baseUrl.replace(/\/+$/, "")}/${endpoint.replace(/^\/+/, "")}`;
+}
+
+async function syncDeliveryOmsGeneric({ provider, shop }) {
+  const credential = await getConnectorCredential(shop, provider);
+  let metadata = {};
+  if (credential?.metadata) {
+    try {
+      metadata = JSON.parse(credential.metadata);
+    } catch {
+      metadata = {};
+    }
+  }
+  const config = normalizeGenericConfig(metadata, provider);
+  if (!config.baseUrl && !config.endpoint) {
+    throw new Error(`Missing API base/endpoint for ${provider}.`);
+  }
+  if (!config.apiKey) {
+    throw new Error(`Missing API key for ${provider}.`);
+  }
+  const url = buildGenericUrl(config.baseUrl, config.endpoint);
+  const headers = {
+    "Content-Type": "application/json",
+  };
+  if (config.authHeaderName) {
+    headers[config.authHeaderName] = config.authPrefix
+      ? `${config.authPrefix} ${config.apiKey}`
+      : config.apiKey;
+  }
+  const response = await fetch(url, { headers });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(`Connector ${provider} sync failed: ${response.status} ${response.statusText}`);
+  }
+
+  const payloads = Array.isArray(data)
+    ? data
+    : Array.isArray(data?.shipments)
+      ? data.shipments
+      : Array.isArray(data?.orders)
+        ? data.orders
+        : Array.isArray(data?.data)
+          ? data.data
+          : Array.isArray(data?.results)
+            ? data.results
+            : [];
+
+  await ensureDeliveryOmsTables();
+  let written = 0;
+  for (const row of payloads) {
+    const merged = { ...row, shop, provider };
+    if (config.kind === "oms") {
+      // eslint-disable-next-line no-await-in-loop
+      await upsertOmsStatus(merged);
+      written += 1;
+    } else {
+      // eslint-disable-next-line no-await-in-loop
+      await upsertDeliveryShipment(merged);
+      written += 1;
+    }
+  }
+
+  return {
+    provider,
+    kind: config.kind,
+    deliveryRows: config.kind === "oms" ? [] : payloads,
+    omsRows: config.kind === "oms" ? payloads : [],
+    rowsWritten: written,
+  };
+}
+
 const CONNECTOR_REGISTRY = {
   meta_ads: {
     name: "Meta Ads",
     mode: "pull",
     sync: syncMetaAdsSpend,
     requiredEnv: ["META_ACCESS_TOKEN", "META_AD_ACCOUNT_ID"],
+    kind: "ads",
   },
   google_ads: {
     name: "Google Ads",
     mode: "pull",
     sync: syncGoogleAdsSpend,
     requiredEnv: ["GOOGLE_ADS_ACCESS_TOKEN", "GOOGLE_ADS_CUSTOMER_ID", "GOOGLE_ADS_DEVELOPER_TOKEN"],
+    kind: "ads",
   },
+  shiprocket: { name: "Shiprocket", mode: "pull", sync: syncDeliveryOmsGeneric, kind: "delivery" },
+  delhivery: { name: "Delhivery", mode: "pull", sync: syncDeliveryOmsGeneric, kind: "delivery" },
+  shipway: { name: "Shipway", mode: "pull", sync: syncDeliveryOmsGeneric, kind: "delivery" },
+  bluedart: { name: "Bluedart", mode: "pull", sync: syncDeliveryOmsGeneric, kind: "delivery" },
+  unicommerce: { name: "Unicommerce", mode: "pull", sync: syncDeliveryOmsGeneric, kind: "oms" },
+  easycom: { name: "Easycom", mode: "pull", sync: syncDeliveryOmsGeneric, kind: "oms" },
+  returns_prime: { name: "Returns Prime", mode: "pull", sync: syncDeliveryOmsGeneric, kind: "delivery" },
   clevertap: { name: "Clevertap", mode: "push" },
   moengage: { name: "MoEngage", mode: "push" },
   webengage: { name: "WebEngage", mode: "push" },
@@ -216,34 +319,38 @@ export async function runConnectorSync({ provider, shop, days = 7 }) {
     });
 
     let spendWrites = 0;
-    for (const row of result.spendRows || []) {
-      const spend = Number(row.adSpend || 0);
-      if (spend <= 0) continue;
-      await addSourceAdSpend(row.source, spend, row.spendDate ? new Date(row.spendDate) : new Date());
-      spendWrites += 1;
-    }
-
     let attributionWrites = 0;
-    for (const row of result.attributionRows || []) {
-      await upsertToolAttribution({
-        shop,
-        tool: normalized,
-        orderId: row.orderId,
-        orderNumber: row.orderNumber,
-        campaignId: row.campaignId,
-        campaignName: row.campaignName,
-        adSetId: row.adSetId,
-        adId: row.adId,
-      });
-      attributionWrites += 1;
+    if (connector.kind === "ads") {
+      for (const row of result.spendRows || []) {
+        const spend = Number(row.adSpend || 0);
+        if (spend <= 0) continue;
+        await addSourceAdSpend(row.source, spend, row.spendDate ? new Date(row.spendDate) : new Date());
+        spendWrites += 1;
+      }
+
+      for (const row of result.attributionRows || []) {
+        await upsertToolAttribution({
+          shop,
+          tool: normalized,
+          orderId: row.orderId,
+          orderNumber: row.orderNumber,
+          campaignId: row.campaignId,
+          campaignName: row.campaignName,
+          adSetId: row.adSetId,
+          adId: row.adId,
+        });
+        attributionWrites += 1;
+      }
+    } else {
+      spendWrites = result.rowsWritten || 0;
     }
 
     const output = {
       provider: normalized,
       mode: connector.mode,
-      spendRowsFetched: (result.spendRows || []).length,
+      spendRowsFetched: connector.kind === "ads" ? (result.spendRows || []).length : 0,
       spendRowsWritten: spendWrites,
-      attributionRowsFetched: (result.attributionRows || []).length,
+      attributionRowsFetched: connector.kind === "ads" ? (result.attributionRows || []).length : 0,
       attributionRowsWritten: attributionWrites,
       requiredEnv: connector.requiredEnv || [],
     };

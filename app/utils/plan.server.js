@@ -6,8 +6,26 @@ export const PLAN_TIERS = {
   premium: "premium",
 };
 
+function parseShopList(value) {
+  return String(value || "")
+    .split(",")
+    .map((row) => row.trim().toLowerCase())
+    .filter(Boolean);
+}
+
 function normalizePlanName(value) {
   return String(value || "").trim().toLowerCase();
+}
+
+export function resolvePremiumOverrideForShop(shop) {
+  const safeShop = String(shop || "").trim().toLowerCase();
+  if (!safeShop) return null;
+  const premiumShops = parseShopList(process.env.PREMIUM_SHOPS || "");
+  if (!premiumShops.includes(safeShop)) return null;
+  return {
+    subscriptions: [{ name: "Premium Monthly (Premium Shops Override)" }],
+    hasActivePayment: true,
+  };
 }
 
 export function detectTierFromSubscriptions(subscriptions = []) {
@@ -35,6 +53,24 @@ export async function resolvePlanContext(billing, isTestMode = false, plans = []
     return {
       subscriptions: [{ name: "Premium Monthly (Dev Override)" }],
       hasActivePayment: true,
+      release: getReleaseContext(shop),
+      ...featureFlagsForTier(PLAN_TIERS.premium),
+    };
+  }
+
+  if (String(process.env.DEV_PREVIEW_MODE || "").toLowerCase() === "true") {
+    return {
+      subscriptions: [{ name: "Premium Monthly (Dev Preview)" }],
+      hasActivePayment: true,
+      release: getReleaseContext(shop),
+      ...featureFlagsForTier(PLAN_TIERS.premium),
+    };
+  }
+
+  const premiumOverride = resolvePremiumOverrideForShop(shop);
+  if (premiumOverride) {
+    return {
+      ...premiumOverride,
       release: getReleaseContext(shop),
       ...featureFlagsForTier(PLAN_TIERS.premium),
     };

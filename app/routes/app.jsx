@@ -2,9 +2,15 @@ import { redirect } from "@remix-run/node";
 import { Link, NavLink, Outlet, useLoaderData, useLocation, useNavigate, useRouteError } from "@remix-run/react";
 import { boundary } from "@shopify/shopify-app-remix/server";
 import { AppProvider } from "@shopify/shopify-app-remix/react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { authenticate, BILLING_PLANS } from "../shopify.server";
 import { trackUiEvent } from "../utils/telemetry.client";
+import { listConnectorCredentials, getRecentConnectorSyncRuns, prisma } from "../utils/db.server";
+import { enqueueJob, ensureJobQueueTable } from "../utils/job-queue.server";
+import { resolvePlanContext } from "../utils/plan.server";
+import { resolveOnboardingGuide } from "../utils/onboarding-guide.server";
+import { isDevPreviewEnabled } from "../utils/dev-preview.server";
+import { getEmbeddedPassthrough, withEmbeddedContext } from "../utils/embedded-nav";
 import netcashStyles from "../styles/netcash.css?url";
 
 export const links = () => [{ rel: "stylesheet", href: netcashStyles }];
@@ -67,10 +73,48 @@ function prettyRecentLabel(href) {
   }
 }
 
+
+function sqlQuote(value) {
+  if (value == null) return "NULL";
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+async function getLatestJobCreatedAt({ type, shop = null }) {
+  await ensureJobQueueTable();
+  const safeType = String(type || "").trim();
+  if (!safeType) return null;
+  const whereShop = shop ? ` AND shop = ${sqlQuote(String(shop).trim().toLowerCase())} ` : "";
+  const rows = await prisma.$queryRawUnsafe(
+    `SELECT MAX(created_at) as createdAt
+     FROM job_queue
+     WHERE type = ${sqlQuote(safeType)}
+     ${whereShop}`,
+  );
+  return rows?.[0]?.createdAt || null;
+}
+
+function isOlderThanMinutes(isoValue, minutes) {
+  if (!isoValue) return true;
+  const ts = new Date(isoValue).getTime();
+  if (!Number.isFinite(ts)) return true;
+  return (Date.now() - ts) > minutes * 60 * 1000;
+}
+
+function pathOnly(href = "/app") {
+  const [path] = String(href || "/app").split("?");
+  return path || "/app";
+}
+
 export const loader = async ({ request }) => {
   const url = new URL(request.url);
-  const { billing } = await authenticate.admin(request);
+  const { billing, session } = await authenticate.admin(request);
   const isProduction = process.env.NODE_ENV === "production";
+  const devPreview = isDevPreviewEnabled();
+  const panelParam = String(url.searchParams.get("panel") || "").toLowerCase();
+  const initialPanel =
+    panelParam === "more" || panelParam === "glossary" || panelParam === "notifications"
+      ? panelParam
+      : null;
 
   const isBillingRoute = url.pathname.startsWith("/app/billing");
   if (isProduction && !isBillingRoute) {
@@ -81,18 +125,108 @@ export const loader = async ({ request }) => {
     });
   }
 
-  return { apiKey: process.env.SHOPIFY_API_KEY || "" };
+  const autoDaemonEnabled = String(process.env.AUTO_SELF_HEAL_DAEMON_ENABLED || "true").toLowerCase() !== "false";
+  if (autoDaemonEnabled && session?.shop && !devPreview) {
+    const shop = String(session.shop || "").trim().toLowerCase();
+    const connectorCooldownMins = Math.max(10, Number(process.env.AUTO_CONNECTOR_SELF_HEAL_COOLDOWN_MINUTES || 45));
+    const connectorStaleMins = Math.max(30, Number(process.env.AUTO_CONNECTOR_STALE_MINUTES || 180));
+    const reportsCooldownMins = Math.max(15, Number(process.env.AUTO_REPORTS_SELF_HEAL_COOLDOWN_MINUTES || 60));
+    const truthCooldownMins = Math.max(15, Number(process.env.AUTO_TRUTH_SELF_HEAL_COOLDOWN_MINUTES || 90));
+
+    try {
+      const [connectors, recentConnectorRuns] = await Promise.all([
+        listConnectorCredentials(shop),
+        getRecentConnectorSyncRuns(shop, 20),
+      ]);
+      const lastConnectorSuccess = (recentConnectorRuns || []).find((row) => row.status === "success") || null;
+      const lastConnectorFailure = (recentConnectorRuns || []).find((row) => row.status === "failed") || null;
+      const failedRecently = !!lastConnectorFailure && !isOlderThanMinutes(lastConnectorFailure.createdAt, connectorCooldownMins);
+      const staleOrMissingSuccess = !lastConnectorSuccess || isOlderThanMinutes(lastConnectorSuccess.createdAt, connectorStaleMins);
+
+      if ((failedRecently || staleOrMissingSuccess) && connectors.length) {
+        for (const credential of connectors) {
+          const provider = String(credential?.provider || "").trim();
+          if (!provider || !credential?.accessToken) continue;
+          await enqueueJob({
+            type: "connector_sync",
+            shop,
+            payload: { shop, provider, force: failedRecently, source: "app_loader_daemon" },
+            uniqueKey: `connector_sync:${shop}:${provider}`,
+            maxAttempts: 5,
+          });
+        }
+      }
+
+      const [lastReportsJobAt, lastTruthJobAt] = await Promise.all([
+        getLatestJobCreatedAt({ type: "reports_run_due" }),
+        getLatestJobCreatedAt({ type: "truth_rollup_refresh", shop }),
+      ]);
+
+      if (isOlderThanMinutes(lastReportsJobAt, reportsCooldownMins)) {
+        await enqueueJob({
+          type: "reports_run_due",
+          payload: { source: "app_loader_daemon", shopHint: shop },
+          uniqueKey: "reports_run_due",
+          maxAttempts: 5,
+        });
+      }
+
+      if (isOlderThanMinutes(lastTruthJobAt, truthCooldownMins)) {
+        await enqueueJob({
+          type: "truth_rollup_refresh",
+          shop,
+          payload: { shop, source: "app_loader_daemon" },
+          uniqueKey: `truth_rollup_refresh:${shop}`,
+          maxAttempts: 5,
+        });
+      }
+    } catch (error) {
+      console.error(`Self-heal daemon failed for ${shop}:`, error);
+    }
+  }
+
+  let onboarding = null;
+  const onboardingAutoguideEnabled = String(process.env.ONBOARDING_AUTOGUIDE_ENABLED || "true").toLowerCase() !== "false";
+  if (onboardingAutoguideEnabled && session?.shop) {
+    try {
+      const planContext = await resolvePlanContext(billing, !isProduction, BILLING_PLANS, session.shop);
+      onboarding = await resolveOnboardingGuide({ shop: session.shop, planContext });
+      const nextStepPath = onboarding?.nextStep ? pathOnly(onboarding.nextStep.href) : null;
+      const isOnboardingRoute = url.pathname.startsWith("/app/onboarding");
+      const isOnNextStepRoute = nextStepPath ? url.pathname.startsWith(nextStepPath) : false;
+      const forceBypass = String(url.searchParams.get("onboarding") || "").toLowerCase() === "off";
+
+      if (!forceBypass && onboarding?.nextStep && !isOnboardingRoute && !isOnNextStepRoute) {
+        const onboardingUrl = new URL("/app/onboarding", "https://netcash.local");
+        for (const [key, value] of url.searchParams.entries()) {
+          if (key === "returnTo") continue;
+          onboardingUrl.searchParams.append(key, value);
+        }
+        onboardingUrl.searchParams.set("returnTo", `${url.pathname}${url.search || ""}`);
+        return redirect(`${onboardingUrl.pathname}?${onboardingUrl.searchParams.toString()}`);
+      }
+    } catch (error) {
+      console.error("Onboarding autoguide failed:", error);
+    }
+  }
+
+  return {
+    apiKey: process.env.SHOPIFY_API_KEY || "",
+    onboarding,
+    initialPanel,
+  };
 };
 
 export default function App() {
-  const { apiKey } = useLoaderData();
+  const { apiKey, onboarding, initialPanel } = useLoaderData();
   const location = useLocation();
   const navigate = useNavigate();
   const searchInputRef = useRef(null);
-  const [commandOpen, setCommandOpen] = useState(false);
-  const [helpOpen, setHelpOpen] = useState(false);
-  const [sidePanel, setSidePanel] = useState(null);
+  const menuButtonRef = useRef(null);
+  const [sidePanel, setSidePanel] = useState(initialPanel || null);
+  const [densityMode, setDensityMode] = useState("auto");
   const [density, setDensity] = useState("comfortable");
+  const [coachVisible, setCoachVisible] = useState(false);
   const [recentPages, setRecentPages] = useState([]);
   const [pinnedInsights, setPinnedInsights] = useState([]);
   const [searchQuery, setSearchQuery] = useState("");
@@ -103,16 +237,43 @@ export default function App() {
   const [searchCategory, setSearchCategory] = useState("all");
   const [voiceSupported, setVoiceSupported] = useState(false);
   const [voiceListening, setVoiceListening] = useState(false);
-  const [searchCoachOpen, setSearchCoachOpen] = useState(false);
+  const [debugClick, setDebugClick] = useState(null);
+  const embeddedPassthroughQuery = getEmbeddedPassthrough(location.search);
+  const withEmbedded = (href) => withEmbeddedContext(href, embeddedPassthroughQuery);
+  const lastMenuOpenRef = useRef(0);
+  const openMenuPanel = useCallback(() => {
+    lastMenuOpenRef.current = Date.now();
+    setSidePanel("more");
+  }, []);
+  const clearPanelParam = useCallback(() => {
+    const params = new URLSearchParams(location.search || "");
+    if (!params.has("panel")) return;
+    params.delete("panel");
+    const nextSearch = params.toString();
+    const next = `${location.pathname}${nextSearch ? `?${nextSearch}` : ""}`;
+    navigate(next, { replace: true, preventScrollReset: true });
+  }, [location.pathname, location.search, navigate]);
+  const panellessHref = (() => {
+    const params = new URLSearchParams(location.search || "");
+    params.delete("panel");
+    const nextSearch = params.toString();
+    return `${location.pathname}${nextSearch ? `?${nextSearch}` : ""}`;
+  })();
+  const closeSidePanel = useCallback(() => {
+    setSidePanel(null);
+    clearPanelParam();
+  }, [clearPanelParam]);
 
   const navItems = [
     { to: "/app", label: "Home", icon: "home" },
     { to: "/app/campaigns", label: "Campaigns", icon: "campaigns" },
-    { to: "/app/alerts", label: "Alerts", icon: "alerts" },
     { to: "/app/universal", label: "Universal Insights", icon: "insights" },
-    { to: "/app/integrations", label: "Integrations", icon: "insights" },
-    { to: "/app/autopilot", label: "Autopilot", icon: "intelligence" },
     { to: "/app/intelligence", label: "Intelligence", icon: "intelligence" },
+  ];
+  const menuPrimaryLinks = [
+    { href: "/app/alerts", label: "Alerts" },
+    { href: "/app/integrations?wizard=1", label: "Integrations" },
+    { href: "/app/autopilot", label: "Autopilot" },
   ];
 
   const quickActions = [
@@ -122,7 +283,7 @@ export default function App() {
     { href: "/app/universal", label: "Review Universal Insights" },
     { href: "/app/integrations?wizard=1", label: "Review Integrations" },
     { href: "/app/autopilot", label: "Review Profit Guardrails Autopilot" },
-    { href: "/app/billing?manage=1", label: "Manage Billing" },
+    { href: "/app/pricing", label: "Manage Billing" },
     { href: "/app/intelligence", label: "Review Intelligence Studio" },
     { href: "/app/additional#connector-templates", label: "Advanced Integrations Docs" },
     { href: "/app/intelligence", label: "Review UTM & Behavior Intelligence" },
@@ -143,7 +304,7 @@ export default function App() {
     { href: "/app/integrations?wizard=1", label: "Integrations wizard", section: "Integrations", keywords: ["meta", "api", "signal", "pixel", "webhook", "integration", "connect"] },
     { href: "/app/integrations?wizard=1", label: "Connect ad accounts", section: "Integrations", keywords: ["connect", "account", "auth", "meta", "google", "login", "link"] },
     { href: "/app/additional#connector-templates", label: "Connector templates", section: "Connectors", keywords: ["template", "mapping", "signal capture", "schema", "field mapping"] },
-    { href: "/app/billing?manage=1", label: "Billing and plans", section: "Billing", keywords: ["plan", "premium", "subscription", "upgrade", "pricing", "starter", "pro"] },
+    { href: "/app/pricing", label: "Billing and plans", section: "Billing", keywords: ["plan", "premium", "subscription", "upgrade", "pricing", "starter", "pro"] },
     { href: "/app/settings", label: "Settings", section: "Settings", keywords: ["preferences", "configuration", "workspace", "setup", "env"] },
     { href: "/app/owner", label: "Owner console", section: "Owner", keywords: ["owner", "brands using app", "adoption", "all shops", "merchant count", "multi brand"] },
   ];
@@ -165,12 +326,32 @@ export default function App() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
+    const savedMode = String(window.localStorage.getItem("nc_density_mode") || "auto").toLowerCase();
+    const mode = savedMode === "compact" || savedMode === "comfortable" ? savedMode : "auto";
+    setDensityMode(mode);
+    const coachSeen = window.localStorage.getItem("nc_shell_coach_seen_v1") === "1";
+    setCoachVisible(!coachSeen);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
     const media = window.matchMedia("(max-width: 980px)");
-    const apply = () => setDensity(media.matches ? "compact" : "comfortable");
+    const apply = () => {
+      const next = densityMode === "auto"
+        ? (media.matches ? "compact" : "comfortable")
+        : densityMode;
+      setDensity(next);
+    };
     apply();
     media.addEventListener("change", apply);
     return () => media.removeEventListener("change", apply);
-  }, []);
+  }, [densityMode]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("nc_density_mode", densityMode);
+    window.dispatchEvent(new CustomEvent("nc-density-change", { detail: { mode: densityMode } }));
+  }, [densityMode]);
 
   useEffect(() => {
     if (typeof document !== "undefined") {
@@ -224,16 +405,7 @@ export default function App() {
     setRecentSearches(Array.isArray(saved) ? saved.slice(0, 6) : []);
     const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     setVoiceSupported(typeof Recognition === "function");
-    const coachSeen = window.localStorage.getItem("nc_search_coach_seen") === "1";
-    if (!coachSeen) setSearchCoachOpen(true);
   }, []);
-
-  const dismissSearchCoach = () => {
-    setSearchCoachOpen(false);
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem("nc_search_coach_seen", "1");
-    }
-  };
 
   const saveRecentSearch = (value) => {
     const text = String(value || "").trim();
@@ -264,7 +436,6 @@ export default function App() {
         searchInputRef.current?.focus();
       }
       if (event.key === "Escape") {
-        setCommandOpen(false);
         setSearchOpen(false);
       }
     };
@@ -274,11 +445,73 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (event) => {
-      if (event.key === "Escape") setSidePanel(null);
+    if (event.key === "Escape") closeSidePanel();
+  };
+  document.addEventListener("keydown", onKeyDown);
+  return () => document.removeEventListener("keydown", onKeyDown);
+  }, [closeSidePanel]);
+  useEffect(() => {
+    const resolveMenuButton = () => {
+      if (menuButtonRef.current) return menuButtonRef.current;
+      const fallback = document.querySelector(".nc-page-shortcuts .nc-page-shortcut-link");
+      return fallback instanceof HTMLElement ? fallback : null;
     };
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, []);
+    const handleEvent = (event) => {
+      const btn = resolveMenuButton();
+      if (!btn) return;
+      const rect = btn.getBoundingClientRect();
+      const x = event.clientX;
+      const y = event.clientY;
+      if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+        event.preventDefault();
+        event.stopPropagation();
+        openMenuPanel();
+      }
+    };
+    window.addEventListener("pointerdown", handleEvent, true);
+    window.addEventListener("click", handleEvent, true);
+    document.addEventListener("pointerdown", handleEvent, true);
+    document.addEventListener("click", handleEvent, true);
+    return () => {
+      window.removeEventListener("pointerdown", handleEvent, true);
+      window.removeEventListener("click", handleEvent, true);
+      document.removeEventListener("pointerdown", handleEvent, true);
+      document.removeEventListener("click", handleEvent, true);
+    };
+  }, [openMenuPanel]);
+
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search || "");
+    if (params.get("debugClicks") !== "1") return undefined;
+    const handler = (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const tag = target.tagName.toLowerCase();
+      const id = target.id ? `#${target.id}` : "";
+      const classes = target.className ? `.${String(target.className).trim().split(/\s+/).slice(0, 3).join(".")}` : "";
+      const text = String(target.textContent || "").trim().slice(0, 80);
+      const rect = target.getBoundingClientRect();
+      document.querySelectorAll("[data-nc-debug-target]").forEach((el) => el.removeAttribute("data-nc-debug-target"));
+      target.setAttribute("data-nc-debug-target", "1");
+      setDebugClick({
+        tag,
+        id,
+        classes,
+        text,
+        x: Math.round(event.clientX),
+        y: Math.round(event.clientY),
+        rect: {
+          left: Math.round(rect.left),
+          top: Math.round(rect.top),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        },
+      });
+    };
+    document.addEventListener("pointerdown", handler, true);
+    return () => document.removeEventListener("pointerdown", handler, true);
+  }, [location.search]);
   useEffect(() => {
     setSearchOpen(false);
     setSearchActiveIndex(0);
@@ -290,10 +523,17 @@ export default function App() {
     trackUiEvent("page_view", { page });
   }, [location.pathname]);
 
+  useEffect(() => {
+    const panelParam = String(new URLSearchParams(location.search || "").get("panel") || "").toLowerCase();
+    if (panelParam === "more" || panelParam === "glossary" || panelParam === "notifications") {
+      setSidePanel(panelParam);
+    }
+  }, [location.search]);
+
   const globalNotifications = [
     { label: "Review latest anomalies", href: "/app/alerts?severity=warning" },
     { label: "Check stop campaigns list", href: "/app/campaigns#campaign-stop-list" },
-    { label: "Manage billing plans", href: "/app/billing?manage=1" },
+    { label: "Manage billing plans", href: "/app/pricing" },
   ];
 
   const formatPinnedInsight = (id) => {
@@ -372,7 +612,7 @@ export default function App() {
     { href: "/app/intelligence", phrases: ["intelligence", "insight", "ai", "nlp", "utm", "attribution", "analysis"] },
     { href: "/app/universal", phrases: ["universal", "ltv", "payment", "coupon", "device", "handset", "hour", "hourly"] },
     { href: "/app/integrations?wizard=1", phrases: ["connector", "connect", "integration", "pixel", "signal", "oauth", "meta connect", "google connect"] },
-    { href: "/app/billing?manage=1", phrases: ["billing", "plan", "pricing", "upgrade", "subscription", "premium", "starter", "pro"] },
+    { href: "/app/pricing", phrases: ["billing", "plan", "pricing", "upgrade", "subscription", "premium", "starter", "pro"] },
     { href: "/app/settings", phrases: ["settings", "config", "configuration", "setup", "preference"] },
     { href: "/app/owner", phrases: ["owner", "owner console", "brands using", "how many brands", "merchant count", "all brands", "all shops", "multi brand", "adoption"] },
     { href: "/app", phrases: ["home", "dashboard", "overview", "summary", "kpi"] },
@@ -400,6 +640,21 @@ export default function App() {
     if (!changed) return null;
     return next.join(" ");
   })();
+  const coachTip = (() => {
+    if (location.pathname.startsWith("/app/campaigns")) {
+      return "Use the filter drawer, then save the current filter set as a view for one-click reuse.";
+    }
+    if (location.pathname.startsWith("/app/alerts")) {
+      return "Sort by critical unread first and switch to compact density for faster triage.";
+    }
+    return "Use Ctrl/Cmd + K for quick navigation and pin key insights from each page.";
+  })();
+  const dismissCoach = () => {
+    setCoachVisible(false);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("nc_shell_coach_seen_v1", "1");
+    }
+  };
   const actionSearchItems = quickActions.map((row) => ({
     href: row.href,
     label: row.label,
@@ -557,7 +812,7 @@ export default function App() {
     form.remove();
   };
   const goToSearchResult = (href) => {
-    navigate(href, { preventScrollReset: true });
+    navigate(withEmbedded(href), { preventScrollReset: true });
     setSearchOpen(false);
     setSearchActiveIndex(0);
   };
@@ -574,7 +829,7 @@ export default function App() {
   };
   const openSearchResultInNewTab = (href) => {
     if (typeof window === "undefined") return;
-    window.open(href, "_blank", "noopener,noreferrer");
+    window.open(withEmbedded(href), "_blank", "noopener,noreferrer");
   };
   const buildAiResponse = (rawQuery) => {
     const value = normalizeQueryText(rawQuery);
@@ -606,7 +861,7 @@ export default function App() {
     if (has(["billing", "plan", "premium", "upgrade", "subscription"])) {
       return {
         text: "Billing controls are available in Plan & Billing. Premium is best for deeper customer behavior analytics, advanced insights, and enterprise connectors.",
-        suggestions: ["/app/billing?manage=1", "/app/universal", "/app/intelligence"],
+      suggestions: ["/app/pricing", "/app/universal", "/app/intelligence"],
       };
     }
     if (has(["customer", "segment", "cohort", "ltv", "behavior", "repeat"])) {
@@ -733,7 +988,6 @@ export default function App() {
       <s-app-nav>
         <s-link href="/app">Home</s-link>
         <s-link href="/app/campaigns">Campaigns</s-link>
-        <s-link href="/app/alerts">Alerts</s-link>
         <s-link href="/app/universal">Universal Insights</s-link>
         <s-link href="/app/intelligence">Intelligence</s-link>
       </s-app-nav>
@@ -951,23 +1205,23 @@ export default function App() {
               </div>
             ) : null}
           </form>
-          {searchCoachOpen ? (
-            <div className="nc-search-coach" role="note" aria-live="polite">
-              <strong>Quick search tips</strong>
-              <span>Use <code>/</code> or <code>Ctrl/Cmd + K</code>. Filter by category, use voice, then press Enter.</span>
-              <button type="button" className="nc-search-coach-close" onClick={dismissSearchCoach}>Got it</button>
-            </div>
-          ) : null}
         </div>
         <div className="nc-app-shell-actions">
           <nav className="nc-app-topnav" aria-label="Workspace">
             {navItems.map((item) => (
               <NavLink
                 key={item.to}
-                to={item.to}
+                to={withEmbedded(item.to)}
                 end={item.to === "/app"}
                 className={({ isActive }) => `nc-app-topnav-link${isActive ? " is-active" : ""}`}
                 preventScrollReset
+                onClick={(event) => {
+                  if (item.to !== "/app") return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  const target = withEmbedded("/app");
+                  window.location.href = target;
+                }}
               >
                 {icon(item.icon, "nc-nav-icon")}
                 <span>{item.label}</span>
@@ -975,43 +1229,106 @@ export default function App() {
             ))}
           </nav>
           <div className="nc-page-shortcuts" aria-label="Page shortcuts">
-            <button
-              type="button"
+            <a
+              href={withEmbedded("/app?panel=more")}
               className="nc-page-shortcut-link"
-              onClick={() => setCommandOpen(true)}
-              title="Quick actions (Ctrl/Cmd + K)"
-            >
-              {icon("quick", "nc-shortcut-icon")}
-              Quick
-            </button>
-            <button
-              type="button"
-              className="nc-page-shortcut-link"
-              onClick={() => setSidePanel("more")}
+              onPointerDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                openMenuPanel();
+              }}
+              onMouseDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                openMenuPanel();
+              }}
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                openMenuPanel();
+              }}
               aria-expanded={sidePanel === "more"}
+              ref={menuButtonRef}
             >
               {icon("menu", "nc-shortcut-icon")}
               Menu
-            </button>
+            </a>
           </div>
         </div>
       </div>
 
+
+      {coachVisible ? (
+        <div className="nc-shell" style={{ paddingTop: "8px", paddingBottom: "6px" }}>
+          <div className="nc-card nc-section nc-coachmark">
+            <div>
+              <strong>Quick guide</strong>
+              <p className="nc-note" style={{ margin: "4px 0 0" }}>{coachTip}</p>
+            </div>
+            <div className="nc-toolbar" style={{ marginBottom: 0 }}>
+              <button type="button" className="nc-chip" onClick={() => setSidePanel("more")}>Open menu</button>
+              <button type="button" className="nc-chip" onClick={dismissCoach}>Got it</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {debugClick ? (
+        <div className="nc-debug-click">
+          <strong>Click Debug</strong>
+          <div>{debugClick.tag}{debugClick.id}{debugClick.classes}</div>
+          <div>{debugClick.text || "(no text)"}</div>
+          <div>Pointer: {debugClick.x},{debugClick.y}</div>
+          <div>Rect: {debugClick.rect.left},{debugClick.rect.top} {debugClick.rect.width}x{debugClick.rect.height}</div>
+        </div>
+      ) : null}
+
       {sidePanel ? (
-        <div className="nc-sidepanel-overlay" role="dialog" aria-modal="true" onClick={() => setSidePanel(null)}>
+        <div
+          className="nc-sidepanel-overlay"
+          role="dialog"
+          aria-modal="true"
+          onMouseDown={(event) => {
+            event.stopPropagation();
+            if (Date.now() - lastMenuOpenRef.current < 250) return;
+            closeSidePanel();
+          }}
+        >
+          <a
+            className="nc-sidepanel-dismiss"
+            href={withEmbedded(panellessHref)}
+            aria-label="Close menu"
+          />
           <aside className="nc-sidepanel" onClick={(event) => event.stopPropagation()}>
             <div className="nc-sidepanel-head">
-              <strong>{sidePanel === "notifications" ? "Notifications" : sidePanel === "glossary" ? "Glossary" : "More"}</strong>
-              <button type="button" className="nc-page-shortcut-link" onClick={() => setSidePanel(null)}>Close</button>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                {sidePanel !== "more" ? (
+                  <a
+                    className="nc-page-shortcut-link"
+                    href={withEmbedded(`${panellessHref}${panellessHref.includes("?") ? "&" : "?"}panel=more`)}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      setSidePanel("more");
+                    }}
+                  >
+                    ← Back
+                  </a>
+                ) : null}
+                <strong>{sidePanel === "notifications" ? "Notifications" : sidePanel === "glossary" ? "Glossary" : "More"}</strong>
+              </div>
+              <a className="nc-page-shortcut-link" href={withEmbedded(panellessHref)} onClick={(event) => {
+                event.preventDefault();
+                closeSidePanel();
+              }}>Close</a>
             </div>
             <div className="nc-sidepanel-body">
-              {sidePanel === "notifications" ? (
-                globalNotifications.map((item) => (
-                  <Link key={item.href} to={item.href} preventScrollReset className="nc-shell-menu-item" onClick={() => setSidePanel(null)}>
-                    {item.label}
-                  </Link>
-                ))
-              ) : sidePanel === "glossary" ? (
+                {sidePanel === "notifications" ? (
+                  globalNotifications.map((item) => (
+                    <Link key={item.href} to={withEmbedded(item.href)} preventScrollReset className="nc-shell-menu-item" onClick={closeSidePanel}>
+                      {item.label}
+                    </Link>
+                  ))
+                ) : sidePanel === "glossary" ? (
                 <div className="nc-glossary-list">
                   {glossaryTerms.map((row) => (
                     <div key={row.key} className="nc-glossary-item">
@@ -1022,21 +1339,88 @@ export default function App() {
                 </div>
               ) : (
                 <>
-                  <button type="button" className="nc-shell-menu-item" onClick={() => setSidePanel("notifications")}>Open Notifications</button>
-                  <button type="button" className="nc-shell-menu-item" onClick={() => setSidePanel("glossary")}>Open Glossary</button>
-                  <button type="button" className="nc-shell-menu-item" onClick={() => { setSidePanel(null); setCommandOpen(true); }}>Open Quick Actions</button>
-                  <Link to="/app/owner" preventScrollReset className="nc-shell-menu-item" onClick={() => setSidePanel(null)}>Owner Console</Link>
-                  <Link to="/app/additional#connector-templates" preventScrollReset className="nc-shell-menu-item" onClick={() => setSidePanel(null)}>Review API & Connectors</Link>
-                  <Link to="/app/billing?manage=1" preventScrollReset className="nc-shell-menu-item" onClick={() => setSidePanel(null)}>Plan & Billing</Link>
-                  <Link to="/app/settings" preventScrollReset className="nc-shell-menu-item" onClick={() => setSidePanel(null)}>Settings</Link>
-                  <div className="nc-sidepanel-subhead">Pinned Insights</div>
-                  {pinnedInsights.length ? (
-                    pinnedInsights.map((id) => (
-                      <Link key={id} to={id.startsWith("alert:") ? "/app/alerts" : "/app/campaigns"} preventScrollReset className="nc-shell-menu-item" onClick={() => setSidePanel(null)}>
-                        {formatPinnedInsight(id)}
+                  <a
+                    className="nc-shell-menu-item"
+                    href={withEmbedded(`${panellessHref}${panellessHref.includes("?") ? "&" : "?"}panel=notifications`)}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      setSidePanel("notifications");
+                    }}
+                  >
+                    Open Notifications
+                  </a>
+                  <a
+                    className="nc-shell-menu-item"
+                    href={withEmbedded(`${panellessHref}${panellessHref.includes("?") ? "&" : "?"}panel=glossary`)}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      setSidePanel("glossary");
+                    }}
+                  >
+                    Open Glossary
+                  </a>
+                  <div className="nc-sidepanel-subhead">Primary</div>
+                  {menuPrimaryLinks.map((item) => (
+                    <Link
+                      key={`menu-primary-${item.href}`}
+                      to={withEmbedded(item.href)}
+                      preventScrollReset
+                      className="nc-shell-menu-item"
+                      onClick={closeSidePanel}
+                    >
+                      {item.label}
+                    </Link>
+                  ))}
+                  <div className="nc-sidepanel-subhead">Quick Actions</div>
+                    {quickActions.slice(0, 6).map((action) => (
+                      <Link
+                        key={`panel-quick-${action.href}`}
+                        to={withEmbedded(action.href)}
+                        preventScrollReset
+                        className="nc-shell-menu-item"
+                        onClick={closeSidePanel}
+                      >
+                        {action.label}
+                    </Link>
+                  ))}
+                  <div className="nc-sidepanel-subhead">Recently Viewed</div>
+                  {recentPages.length > 1 ? (
+                    recentPages.slice(1).map((href) => (
+                      <Link
+                        key={`panel-recent-${href}`}
+                        to={withEmbedded(href)}
+                        preventScrollReset
+                        className="nc-shell-menu-item"
+                        onClick={closeSidePanel}
+                      >
+                        {prettyRecentLabel(href)}
                       </Link>
                     ))
                   ) : (
+                    <div className="nc-note">No recent pages yet.</div>
+                  )}
+                  <Link to={withEmbedded("/app/owner")} preventScrollReset className="nc-shell-menu-item" onClick={closeSidePanel}>Owner Console</Link>
+                  <Link to={withEmbedded("/app/additional#connector-templates")} preventScrollReset className="nc-shell-menu-item" onClick={closeSidePanel}>Review API & Connectors</Link>
+                  <Link to={withEmbedded("/app/pricing")} preventScrollReset className="nc-shell-menu-item" onClick={closeSidePanel}>Plan & Billing</Link>
+                  <Link to={withEmbedded("/app/settings")} preventScrollReset className="nc-shell-menu-item" onClick={closeSidePanel}>Settings</Link>
+                  <div className="nc-sidepanel-subhead">Display Density</div>
+                  <div className="nc-density-toggle">
+                    <button type="button" className={`nc-chip ${densityMode === "auto" ? "is-active" : ""}`} onClick={() => setDensityMode("auto")}>Auto</button>
+                    <button type="button" className={`nc-chip ${densityMode === "comfortable" ? "is-active" : ""}`} onClick={() => setDensityMode("comfortable")}>Comfortable</button>
+                    <button type="button" className={`nc-chip ${densityMode === "compact" ? "is-active" : ""}`} onClick={() => setDensityMode("compact")}>Compact</button>
+                  </div>
+                  <div className="nc-note">Current density: {densityMode === "auto" ? `Auto (${density})` : density}</div>
+                  <div className="nc-sidepanel-subhead">Help</div>
+                  <div className="nc-note">Use Ctrl/Cmd + K or / to focus search.</div>
+                  <div className="nc-note">ROAS: revenue / ad spend. Real ROAS: net-cash aware ROAS.</div>
+                  <div className="nc-sidepanel-subhead">Pinned Insights</div>
+                    {pinnedInsights.length ? (
+                      pinnedInsights.map((id) => (
+                        <Link key={id} to={withEmbedded(id.startsWith("alert:") ? "/app/alerts" : "/app/campaigns")} preventScrollReset className="nc-shell-menu-item" onClick={closeSidePanel}>
+                          {formatPinnedInsight(id)}
+                        </Link>
+                      ))
+                    ) : (
                     <div className="nc-note">No pinned insights yet.</div>
                   )}
                 </>
@@ -1046,65 +1430,16 @@ export default function App() {
         </div>
       ) : null}
 
-      {recentPages.length > 1 ? (
-        <div className="nc-recent-strip" aria-label="Recently viewed">
-          <span className="nc-note">Recently viewed:</span>
-          {recentPages.slice(1).map((href) => (
-            <Link key={href} to={href} preventScrollReset className="nc-page-shortcut-link">
-              {prettyRecentLabel(href)}
-            </Link>
-          ))}
-        </div>
-      ) : null}
-
-      {commandOpen ? (
-        <div className="nc-command-overlay" role="dialog" aria-modal="true" onClick={() => setCommandOpen(false)}>
-          <div className="nc-command-modal" onClick={(event) => event.stopPropagation()}>
-            <div className="nc-command-head">
-              <strong>Quick Actions</strong>
-              <span className="nc-note">Ctrl/Cmd + K</span>
-            </div>
-            <div className="nc-command-list">
-              {quickActions.map((action) => (
-                <Link key={action.href} to={action.href} preventScrollReset className="nc-command-item" onClick={() => setCommandOpen(false)}>
-                  {action.label}
-                </Link>
-              ))}
-            </div>
+      {onboarding?.nextStep ? (
+        <div className="nc-shell" style={{ paddingTop: "0", paddingBottom: "8px" }}>
+          <div className="nc-card nc-section">
+            <p className="nc-note" style={{ marginBottom: "6px" }}>
+              Onboarding {Number(onboarding.progressPercent || 0)}% complete. Next step: <strong>{onboarding.nextStep.label}</strong>
+            </p>
+            <Link to={withEmbedded("/app/onboarding")} className="nc-chip" preventScrollReset>Open guided onboarding</Link>
           </div>
         </div>
       ) : null}
-
-      <button
-        type="button"
-        className="nc-help-fab"
-        title="Help"
-        aria-label="Open help"
-        onClick={() => setHelpOpen(true)}
-      >
-        ?
-      </button>
-
-      {helpOpen ? (
-        <div className="nc-command-overlay" role="dialog" aria-modal="true" onClick={() => setHelpOpen(false)}>
-          <div className="nc-command-modal" onClick={(event) => event.stopPropagation()}>
-            <div className="nc-command-head">
-              <strong>Help</strong>
-              <button type="button" className="nc-page-shortcut-link" onClick={() => setHelpOpen(false)}>Close</button>
-            </div>
-            <div className="nc-stack-sm">
-              <div><strong>Shortcuts:</strong> `Ctrl/Cmd+K` opens Quick Actions.</div>
-              <div><strong>Glossary:</strong> `ROAS` return on ad spend, `Net Cash` realized post-cost cash, `Incrementality` lift vs baseline.</div>
-              <div className="nc-toolbar" style={{ marginBottom: 0 }}>
-                <Link to="/app/intelligence" preventScrollReset className="nc-chip">Where to find UTM</Link>
-                <Link to="/app/campaigns" preventScrollReset className="nc-chip">Where to optimize campaigns</Link>
-                <Link to="/app/alerts" preventScrollReset className="nc-chip">Where to review alerts</Link>
-              </div>
-            </div>
-          </div>
-        </div>
-      ) : null}
-
       <Outlet />
     </AppProvider>
   );

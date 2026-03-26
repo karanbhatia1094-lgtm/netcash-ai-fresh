@@ -1,5 +1,5 @@
-import { Form, Link, useFetcher, useLoaderData, useLocation, useRevalidator, useRouteError, isRouteErrorResponse } from "@remix-run/react";
-import { useEffect, useState } from "react";
+import { Form, Link, useFetcher, useLoaderData, useLocation, useNavigate, useRevalidator, useRouteError, isRouteErrorResponse } from "@remix-run/react";
+import { useCallback, useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import { trackUiEvent } from "../utils/telemetry.client";
 import {
@@ -12,6 +12,7 @@ import {
   listConnectorCredentials,
 } from "../utils/db.server";
 import { listReportSchedules } from "../utils/report-scheduler.server";
+import { isDevPreviewEnabled } from "../utils/dev-preview.server";
 
 const SEVERITIES = ["all", "critical", "warning", "info"];
 
@@ -20,6 +21,22 @@ export async function loader({ request }) {
   const url = new URL(request.url);
   const severity = String(url.searchParams.get("severity") || "all").toLowerCase();
   const safeSeverity = SEVERITIES.includes(severity) ? severity : "all";
+  const devPreview = isDevPreviewEnabled();
+
+  if (devPreview) {
+    return {
+      shop: session.shop,
+      severity: safeSeverity,
+      events: [],
+      rules: [],
+      evaluation: { created: 0 },
+      permissions: {
+        hasMetaConnector: false,
+        hasGoogleConnector: false,
+      },
+      scheduledReports: [],
+    };
+  }
 
   const [rules, settings, evaluation] = await Promise.all([
     listAlertRules(),
@@ -92,20 +109,32 @@ export async function action({ request }) {
 
 export default function AlertsPage() {
   const location = useLocation();
+  const navigate = useNavigate();
   const revalidator = useRevalidator();
   const readFetcher = useFetcher();
   const scheduleFetcher = useFetcher();
-  const { severity, events, rules, evaluation, permissions, scheduledReports } = useLoaderData();
+  const { shop, severity, events, rules, evaluation, permissions, scheduledReports } = useLoaderData();
   const [showSkeleton, setShowSkeleton] = useState(true);
+  const [activeView, setActiveView] = useState("overview");
   const [pinnedInsights, setPinnedInsights] = useState([]);
-  const [alertsPreset, setAlertsPreset] = useState("full");
   const [presetToast, setPresetToast] = useState("");
   const [readOverrides, setReadOverrides] = useState({});
   const [rowFeedback, setRowFeedback] = useState({});
+  const [densityMode, setDensityMode] = useState("auto");
   const [tableDensity, setTableDensity] = useState("comfortable");
   const [quickFilter, setQuickFilter] = useState("all");
+  const [showFilterDrawer, setShowFilterDrawer] = useState(false);
+  const [savedViews, setSavedViews] = useState([]);
+  const [viewDraftName, setViewDraftName] = useState("");
   const [savedReports, setSavedReports] = useState(Array.isArray(scheduledReports) ? scheduledReports : []);
   const [reportDraft, setReportDraft] = useState({ name: "", frequency: "weekly", email: "" });
+  const savedViewsKey = `nc_alerts_saved_views_${String(shop || "global").toLowerCase()}`;
+  const applyViewSessionKey = `nc_alerts_apply_view_${String(shop || "global").toLowerCase()}`;
+  const appliedFilterTokens = [
+    `View: ${activeView.replace("_", " ")}`,
+    `Quick filter: ${quickFilter.replace("_", " ")}`,
+    `Severity: ${severity}`,
+  ];
   const latestEventAtMs = (events || []).reduce((max, row) => {
     const ts = row?.lastSeenAt ? new Date(row.lastSeenAt).getTime() : 0;
     return Number.isFinite(ts) ? Math.max(max, ts) : max;
@@ -144,24 +173,33 @@ export default function AlertsPage() {
   }, []);
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const savedPreset = window.localStorage.getItem("nc_alerts_preset");
-    if (savedPreset) setAlertsPreset(savedPreset);
-  }, []);
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem("nc_alerts_preset", alertsPreset);
-  }, [alertsPreset]);
-  useEffect(() => {
-    if (typeof window === "undefined") return;
     const media = window.matchMedia("(max-width: 980px)");
-    const apply = () => setTableDensity(media.matches ? "compact" : "comfortable");
+    const readMode = () => {
+      const saved = String(window.localStorage.getItem("nc_density_mode") || "auto").toLowerCase();
+      return saved === "compact" || saved === "comfortable" ? saved : "auto";
+    };
+    const apply = (forcedMode) => {
+      const mode = forcedMode || readMode();
+      setDensityMode(mode);
+      setTableDensity(mode === "auto" ? (media.matches ? "compact" : "comfortable") : mode);
+    };
     apply();
+    const onDensityChange = (event) => apply(event?.detail?.mode);
     media.addEventListener("change", apply);
-    return () => media.removeEventListener("change", apply);
+    window.addEventListener("nc-density-change", onDensityChange);
+    return () => {
+      media.removeEventListener("change", apply);
+      window.removeEventListener("nc-density-change", onDensityChange);
+    };
   }, []);
   useEffect(() => {
     if (Array.isArray(scheduledReports)) setSavedReports(scheduledReports);
   }, [scheduledReports]);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const saved = JSON.parse(window.localStorage.getItem(savedViewsKey) || "[]");
+    if (Array.isArray(saved)) setSavedViews(saved.slice(0, 20));
+  }, [savedViewsKey]);
   useEffect(() => {
     if (scheduleFetcher.state !== "idle") return;
     if (!scheduleFetcher.data?.ok || !scheduleFetcher.data?.schedule) return;
@@ -199,16 +237,18 @@ export default function AlertsPage() {
     trackUiEvent("alert_mark_read_toggled", { alertId, readValue });
     pushRowFeedback(`alert:${alertId}`, readValue ? "Marked read" : "Marked unread");
   };
-  const selectAlertsPreset = (preset) => {
-    setAlertsPreset(preset);
-    trackUiEvent("preset_changed", { page: "alerts", preset });
-    const labels = { triage: "Triage", "rules-first": "Rules First", full: "Full View" };
-    setPresetToast(`${labels[preset] || "Preset"} applied`);
+  const selectAlertsView = (view) => {
+    setActiveView(view);
+    trackUiEvent("view_changed", { page: "alerts", view });
+    const labels = { overview: "Overview", rules: "Rules", deep_dive: "Deep Dive" };
+    setPresetToast(`${labels[view] || "View"} selected`);
     setTimeout(() => setPresetToast(""), 1400);
   };
-  const showRules = alertsPreset === "rules-first" || alertsPreset === "full";
-  const showFilter = alertsPreset === "rules-first" || alertsPreset === "full";
-  const showEvents = alertsPreset === "triage" || alertsPreset === "full";
+  const onChangeView = (event) => selectAlertsView(String(event.target.value || "overview"));
+  const onChangeQuickFilter = (event) => setQuickFilter(String(event.target.value || "all"));
+  const showOverview = activeView === "overview";
+  const showRules = activeView === "rules";
+  const showDeepDive = activeView === "deep_dive";
   const exportCsvFile = (filename, rowsCsv) => {
     if (typeof window === "undefined") return;
     const csv = rowsCsv.map((r) => r.map((v) => `"${String(v ?? "").replaceAll("\"", "\"\"")}"`).join(",")).join("\n");
@@ -248,6 +288,67 @@ export default function AlertsPage() {
     payload.append("filters", JSON.stringify({ severity, days: 30 }));
     scheduleFetcher.submit(payload, { method: "post", action: "/api/reports.schedule" });
   };
+  const applyDensityMode = (mode) => {
+    const normalized = mode === "compact" || mode === "comfortable" ? mode : "auto";
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("nc_density_mode", normalized);
+      window.dispatchEvent(new CustomEvent("nc-density-change", { detail: { mode: normalized } }));
+    }
+    setDensityMode(normalized);
+  };
+  const saveCurrentView = () => {
+    const name = String(viewDraftName || "").trim() || `Alerts ${severity} ${quickFilter}`;
+    const nextView = {
+      id: `av-${Date.now()}`,
+      name,
+      severity,
+      quickFilter,
+      activeView,
+      createdAt: new Date().toISOString(),
+    };
+    setSavedViews((current) => {
+      const next = [nextView, ...current.filter((row) => row.name.toLowerCase() !== name.toLowerCase())].slice(0, 20);
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(savedViewsKey, JSON.stringify(next));
+      }
+      return next;
+    });
+    setViewDraftName("");
+    setPresetToast(`Saved view: ${name}`);
+    setTimeout(() => setPresetToast(""), 1400);
+  };
+  const applySavedView = useCallback((view) => {
+    if (!view) return;
+    setQuickFilter(String(view.quickFilter || "all"));
+    setActiveView(String(view.activeView || "overview"));
+    const targetSeverity = String(view.severity || "all");
+    navigate(`/app/alerts?severity=${encodeURIComponent(targetSeverity)}`, { preventScrollReset: true });
+    setPresetToast(`Applied view: ${view.name || "Saved view"}`);
+    setTimeout(() => setPresetToast(""), 1400);
+  }, [navigate]);
+  const deleteSavedView = (id) => {
+    setSavedViews((current) => {
+      const next = current.filter((row) => row.id !== id);
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(savedViewsKey, JSON.stringify(next));
+      }
+      return next;
+    });
+    setPresetToast("Saved view removed");
+    setTimeout(() => setPresetToast(""), 1400);
+  };
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const raw = window.sessionStorage.getItem(applyViewSessionKey);
+    if (!raw) return;
+    window.sessionStorage.removeItem(applyViewSessionKey);
+    try {
+      const view = JSON.parse(raw);
+      applySavedView(view);
+    } catch {
+      // ignore invalid payload
+    }
+  }, [applyViewSessionKey, applySavedView]);
 
   return (
     <div className={`nc-shell nc-alerts ${tableDensity === "compact" ? "nc-density-compact" : ""}`}>
@@ -263,50 +364,125 @@ export default function AlertsPage() {
         Need period-to-period movement? Review <a href="/app?compare=1">Home Compare Mode</a>.
       </p>
       <div className="nc-toolbar nc-section" style={{ marginBottom: 0 }}>
-        <button type="button" className={`nc-chip ${quickFilter === "all" ? "is-active" : ""}`} onClick={() => setQuickFilter("all")}>All alerts</button>
-        <button type="button" className={`nc-chip ${quickFilter === "critical_unread" ? "is-active" : ""}`} onClick={() => setQuickFilter("critical_unread")}>Critical unread</button>
-        <button type="button" className={`nc-chip ${quickFilter === "unread" ? "is-active" : ""}`} onClick={() => setQuickFilter("unread")}>Unread only</button>
-        <button type="button" className={`nc-chip ${quickFilter === "read" ? "is-active" : ""}`} onClick={() => setQuickFilter("read")}>Read only</button>
+        <label className="nc-form-field nc-inline-field">
+          <span>View</span>
+          <select value={activeView} onChange={onChangeView}>
+            <option value="overview">Overview</option>
+            <option value="rules">Rules</option>
+            <option value="deep_dive">Deep Dive</option>
+          </select>
+        </label>
+        <label className="nc-form-field nc-inline-field">
+          <span>Quick filter</span>
+          <select value={quickFilter} onChange={onChangeQuickFilter}>
+            <option value="all">All alerts</option>
+            <option value="critical_unread">Critical unread</option>
+            <option value="unread">Unread only</option>
+            <option value="read">Read only</option>
+          </select>
+        </label>
+        <label className="nc-form-field nc-inline-field">
+          <span>Severity</span>
+          <select value={severity} onChange={(event) => navigate(`/app/alerts?severity=${encodeURIComponent(event.target.value)}`, { preventScrollReset: true })}>
+            {SEVERITIES.map((item) => (
+              <option key={`severity-option-${item}`} value={item}>{item}</option>
+            ))}
+          </select>
+        </label>
+        <label className="nc-form-field nc-inline-field">
+          <span>Saved view</span>
+          <select
+            value=""
+            onChange={(event) => {
+              const selected = savedViews.find((row) => row.id === String(event.target.value || ""));
+              if (selected) applySavedView(selected);
+            }}
+          >
+            <option value="">Select saved view</option>
+            {savedViews.map((row) => (
+              <option key={`alerts-view-${row.id}`} value={row.id}>{row.name}</option>
+            ))}
+          </select>
+        </label>
       </div>
       {presetToast ? <div className="nc-toast">{presetToast}</div> : null}
+      <div className="nc-toolbar nc-section nc-applied-filter-row" style={{ marginBottom: 0 }}>
+        {appliedFilterTokens.map((token) => (
+          <span key={`alerts-filter-token-${token}`} className="nc-chip">{token}</span>
+        ))}
+      </div>
       <div className="nc-card nc-section nc-glass nc-alert-controls">
         <div className="nc-alert-controls-head">
-          <button
-            type="button"
-            className="nc-icon-btn"
-            onClick={() => {
-              trackUiEvent("refresh_clicked", { page: "alerts" });
-              revalidator.revalidate();
-            }}
-            disabled={revalidator.state === "loading"}
-          >
-            {revalidator.state === "loading" ? "Refreshing..." : "Refresh now"}
+          <button type="button" className="nc-icon-btn" onClick={() => {
+            trackUiEvent("refresh_clicked", { page: "alerts" });
+            revalidator.revalidate();
+          }} disabled={revalidator.state === "loading"}>
+            {revalidator.state === "loading" ? "Refreshing..." : "Refresh"}
           </button>
           <span className={syncBadgeClass} title={syncTitle}>{syncLabel}</span>
         </div>
         <div className="nc-alert-controls-grid">
-          <div className="nc-alert-control-group" aria-label="Alerts presets">
-            <span className="nc-note">Mode</span>
-            <div className="nc-toolbar" style={{ marginBottom: 0 }}>
-              {[
-                ["triage", "Triage"],
-                ["rules-first", "Rules First"],
-                ["full", "Full View"],
-              ].map(([key, label]) => (
-                <button key={key} type="button" className={`nc-chip ${alertsPreset === key ? "is-active" : ""}`} onClick={() => selectAlertsPreset(key)}>
-                  {label}
-                </button>
-              ))}
-            </div>
-          </div>
           <div className="nc-alert-control-group" aria-label="Alerts table density">
             <span className="nc-note">Density</span>
-            <div className="nc-toolbar" style={{ marginBottom: 0 }}>
-              <span className="nc-chip is-active">{tableDensity === "compact" ? "Auto: Compact" : "Auto: Comfortable"}</span>
-            </div>
+            <select value={densityMode} onChange={(event) => applyDensityMode(String(event.target.value || "auto"))}>
+              <option value="auto">Auto</option>
+              <option value="comfortable">Comfortable</option>
+              <option value="compact">Compact</option>
+            </select>
+          </div>
+          <div className="nc-alert-control-group" aria-label="Alerts filter drawer">
+            <span className="nc-note">Filters</span>
+            <button type="button" className="nc-chip" onClick={() => setShowFilterDrawer((current) => !current)}>
+              {showFilterDrawer ? "Hide drawer" : "Open drawer"}
+            </button>
           </div>
         </div>
       </div>
+      {showFilterDrawer ? (
+        <div className="nc-card nc-section nc-glass nc-filter-drawer">
+          <div className="nc-section-head-inline">
+            <h3 style={{ margin: 0 }}>Filter Drawer</h3>
+            <button
+              type="button"
+              className="nc-chip"
+              onClick={() => {
+                setQuickFilter("all");
+                navigate("/app/alerts?severity=all", { preventScrollReset: true });
+              }}
+            >
+              Reset all filters
+            </button>
+          </div>
+          <div className="nc-toolbar" style={{ marginBottom: 0 }}>
+            <button type="button" className={`nc-chip ${quickFilter === "all" ? "is-active" : ""}`} onClick={() => setQuickFilter("all")}>All</button>
+            <button type="button" className={`nc-chip ${quickFilter === "critical_unread" ? "is-active" : ""}`} onClick={() => setQuickFilter("critical_unread")}>Critical unread</button>
+            <button type="button" className={`nc-chip ${quickFilter === "unread" ? "is-active" : ""}`} onClick={() => setQuickFilter("unread")}>Unread</button>
+            <button type="button" className={`nc-chip ${quickFilter === "read" ? "is-active" : ""}`} onClick={() => setQuickFilter("read")}>Read</button>
+          </div>
+          <div className="nc-grid-4">
+            <label className="nc-form-field">Save current view
+              <input value={viewDraftName} onChange={(event) => setViewDraftName(event.target.value)} placeholder="Name this alerts view" />
+            </label>
+            <div className="nc-form-field">
+              <span>Actions</span>
+              <div className="nc-toolbar" style={{ marginBottom: 0 }}>
+                <button type="button" className="nc-chip" onClick={saveCurrentView}>Save view</button>
+                <button type="button" className="nc-chip" onClick={() => setShowFilterDrawer(false)}>Close drawer</button>
+              </div>
+            </div>
+          </div>
+          {savedViews.length ? (
+            <div className="nc-toolbar" style={{ marginBottom: 0 }}>
+              {savedViews.slice(0, 6).map((view) => (
+                <span key={`alerts-view-pill-${view.id}`} className="nc-saved-view-pill">
+                  <button type="button" className="nc-chip" onClick={() => applySavedView(view)}>{view.name}</button>
+                  <button type="button" className="nc-chip" onClick={() => deleteSavedView(view.id)}>Delete</button>
+                </span>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
       {!permissions?.hasMetaConnector || !permissions?.hasGoogleConnector ? (
         <div className="nc-card nc-section nc-glass">
           <h3>Permission Check</h3>
@@ -317,7 +493,8 @@ export default function AlertsPage() {
           </div>
         </div>
       ) : null}
-      <div className="nc-card nc-section nc-glass">
+      {showDeepDive ? <details className="nc-card nc-section nc-glass" open>
+        <summary className="nc-details-summary">Saved Reports & Scheduled Export</summary>
         <div className="nc-section-head-inline">
           <h2>Saved Reports & Scheduled Export</h2>
           <div className="nc-toolbar" style={{ marginBottom: 0 }}>
@@ -346,7 +523,7 @@ export default function AlertsPage() {
             <li key={row.id}>{row.label || row.name} {row.frequency ? `(${row.frequency} to ${row.email})` : ""}</li>
           ))}
         </ul>
-      </div>
+      </details> : null}
 
       {showRules ? <div className="nc-card nc-section nc-glass" id="alert-rules">
         <div className="nc-section-head-inline">
@@ -409,18 +586,7 @@ export default function AlertsPage() {
         </table>
       </div> : null}
 
-      {showFilter ? <div className="nc-card nc-section">
-        <h2>Severity Filter</h2>
-        <div className="nc-toolbar">
-          {SEVERITIES.map((item) => (
-            <Link key={item} to={`?severity=${item}`} className={`nc-chip ${severity === item ? "is-active" : ""}`}>
-              {item}
-            </Link>
-          ))}
-        </div>
-      </div> : null}
-
-      {showEvents ? <div className="nc-card" id="alert-events">
+      {showOverview ? <div className="nc-card" id="alert-events">
         <div className="nc-section-head-inline">
           <h2>Events</h2>
           <div className="nc-toolbar" style={{ marginBottom: 0 }}>
@@ -462,8 +628,10 @@ export default function AlertsPage() {
                     <div className="nc-empty-state">
                       <div className="nc-empty-illus nc-empty-illus-alerts">N</div>
                       <div>No alerts for this quick filter.</div>
+                      <div className="nc-empty-mini">Try severity = all and critical unread filter in the drawer.</div>
                       <a href="/app/alerts" className="nc-chip">Reset Filters</a>
                       <a href="/app/campaigns" className="nc-chip">Review Campaign Health</a>
+                      <button type="button" className="nc-chip" onClick={() => setShowFilterDrawer(true)}>Open Filter Drawer</button>
                     </div>
                   </td>
                 </tr>

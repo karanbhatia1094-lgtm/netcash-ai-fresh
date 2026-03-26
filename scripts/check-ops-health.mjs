@@ -45,6 +45,8 @@ async function main() {
 
   checks.push(await check(`${baseUrl}/api/autopilot/cron?dryRun=true&maxShops=1`, headers));
   checks.push(await check(`${baseUrl}/api/jobs/worker?maxJobs=1&types=__ops_healthcheck_noop`, headers));
+  checks.push(await check(`${baseUrl}/api/monitoring/overview?windowMinutes=60&syncDays=7`, headers));
+  checks.push(await check(`${baseUrl}/api/monitoring/alerts?windowMinutes=60&syncDays=7&autoRepair=true`, headers));
 
   const failed = checks.filter((row) => !row.ok);
   console.log(JSON.stringify({

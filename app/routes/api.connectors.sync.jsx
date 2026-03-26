@@ -84,7 +84,7 @@ export async function loader() {
     endpoint: "/api/connectors/sync",
     method: "POST",
     requiredBody: {
-      provider: "meta_ads | google_ads",
+      provider: "meta_ads | google_ads | shiprocket | delhivery | shipway | unicommerce | easycom | returns_prime | bluedart",
       shop: "your-store.myshopify.com",
       days: 7,
     },

@@ -1,6 +1,11 @@
 import { redirect } from "@remix-run/node";
 import { useLoaderData } from "@remix-run/react";
 
+function isValidShopDomain(value) {
+  const shop = String(value || "").trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(shop);
+}
+
 export const loader = async ({ request }) => {
   const url = new URL(request.url);
 
@@ -15,9 +20,25 @@ export const loader = async ({ request }) => {
 
   // If this app is opened directly without query context but a default dev store is configured,
   // start auth automatically so no manual domain input is required in local/dev flows.
-  const defaultShop = process.env.SHOPIFY_SHOP_DOMAIN || "";
-  if (defaultShop) {
+  const defaultShop = String(process.env.SHOPIFY_SHOP_DOMAIN || "").trim().toLowerCase();
+  if (isValidShopDomain(defaultShop)) {
     throw redirect(`/auth/login?shop=${encodeURIComponent(defaultShop)}`);
+  }
+
+  // Auto-resume to latest known authenticated shop when opened directly in dev/local.
+  try {
+    const { prisma } = await import("../../utils/db.server");
+    const recentSession = await prisma.session.findFirst({
+      where: { accessToken: { not: null } },
+      select: { shop: true },
+      orderBy: { id: "desc" },
+    });
+    const recentShop = String(recentSession?.shop || "").trim().toLowerCase();
+    if (isValidShopDomain(recentShop)) {
+      throw redirect(`/auth/login?shop=${encodeURIComponent(recentShop)}`);
+    }
+  } catch {
+    // If session lookup fails, keep the fallback landing page.
   }
 
   return { defaultShop };

@@ -1,0 +1,21 @@
+# Staging Shopify app config template
+# Use a public HTTPS URL for the hosted staging app.
+
+client_id = "ca00a6ab66f5d61288a89a6a3fabce24"
+name = "netcash-ai-fresh-staging"
+application_url = "https://netcash-web.onrender.com"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = false
+
+[webhooks]
+api_version = "2025-10"
+
+[access_scopes]
+scopes = "read_orders,read_customers,read_products,write_products"
+optional_scopes = []
+use_legacy_install_flow = false
+
+[auth]
+redirect_urls = ["https://netcash-web.onrender.com/auth/callback"]

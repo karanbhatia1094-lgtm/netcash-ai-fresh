@@ -1,6 +1,7 @@
 import { getQueueBacklogSummary, processQueueBatch } from "../utils/job-queue.server";
 import { recordApiMetric } from "../utils/api-metrics.server";
 import { jobHandlers } from "../utils/job-handlers.server";
+import { scheduleAutonomousRepairs } from "../utils/autonomous-ops.server";
 
 function json(data, init = {}) {
   return new Response(JSON.stringify(data), {
@@ -30,6 +31,17 @@ function authorize(request) {
   const provided = request.headers.get("x-netcash-cron-key") || "";
   if (!provided || provided !== expected) return { ok: false, reason: "Unauthorized" };
   return { ok: true };
+}
+
+let lastAutoRepairRunAt = 0;
+
+function shouldRunAutoRepair() {
+  if (String(process.env.AUTO_REPAIR_ENABLED || "true").toLowerCase() === "false") return false;
+  const intervalMinutes = Math.max(5, Number(process.env.AUTO_REPAIR_MIN_INTERVAL_MINUTES || 20));
+  const now = Date.now();
+  if (now - lastAutoRepairRunAt < intervalMinutes * 60 * 1000) return false;
+  lastAutoRepairRunAt = now;
+  return true;
 }
 
 async function run(request) {
@@ -62,7 +74,11 @@ async function run(request) {
     maxJobs,
   });
   const after = await getQueueBacklogSummary();
-  const response = json({ ok: true, ...result, queue: { before, after } });
+  let repair = null;
+  if (shouldRunAutoRepair()) {
+    repair = await scheduleAutonomousRepairs({ source: "jobs_worker" });
+  }
+  const response = json({ ok: true, ...result, queue: { before, after }, repair });
   await recordApiMetric({
     routeKey: "api.jobs.worker",
     statusCode,
