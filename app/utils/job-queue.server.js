@@ -6,7 +6,6 @@ const QUEUED = "queued";
 const PROCESSING = "processing";
 const SUCCEEDED = "succeeded";
 const FAILED = "failed";
-const DEAD_LETTER_REASON_MAX = 300;
 
 function nowIso() {
   return new Date().toISOString();
@@ -62,25 +61,6 @@ function autoscaleConfig() {
   };
 }
 
-function sanitizeWorkerId(value) {
-  const raw = String(value || "").trim().toLowerCase();
-  if (!raw) return "worker";
-  return raw.slice(0, 120);
-}
-
-function deadLetterConfig() {
-  return {
-    enabled: String(process.env.JOB_DEAD_LETTER_ENABLED || "true").toLowerCase() !== "false",
-    retentionDays: Math.max(7, Math.min(365, Number(process.env.JOB_DEAD_LETTER_RETENTION_DAYS || 45))),
-  };
-}
-
-function heartbeatConfig() {
-  return {
-    staleMinutes: Math.max(1, Number(process.env.WORKER_HEARTBEAT_STALE_MINUTES || 3)),
-  };
-}
-
 export async function ensureJobQueueTable() {
   await prisma.$executeRawUnsafe(`
     CREATE TABLE IF NOT EXISTS job_queue (
@@ -105,35 +85,6 @@ export async function ensureJobQueueTable() {
   await prisma.$executeRawUnsafe("CREATE INDEX IF NOT EXISTS idx_job_queue_status_run_after ON job_queue(status, run_after)");
   await prisma.$executeRawUnsafe("CREATE INDEX IF NOT EXISTS idx_job_queue_shop_created ON job_queue(shop, created_at)");
   await prisma.$executeRawUnsafe("CREATE INDEX IF NOT EXISTS idx_job_queue_type_status ON job_queue(type, status)");
-  await prisma.$executeRawUnsafe(`
-    CREATE TABLE IF NOT EXISTS job_dead_letter (
-      id TEXT PRIMARY KEY,
-      job_id TEXT NOT NULL,
-      type TEXT NOT NULL,
-      shop TEXT,
-      payload_json TEXT,
-      attempts INTEGER NOT NULL DEFAULT 0,
-      max_attempts INTEGER NOT NULL DEFAULT 0,
-      error_message TEXT,
-      reason TEXT,
-      failed_at TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    )
-  `);
-  await prisma.$executeRawUnsafe("CREATE INDEX IF NOT EXISTS idx_job_dead_letter_shop_created ON job_dead_letter(shop, created_at)");
-  await prisma.$executeRawUnsafe("CREATE INDEX IF NOT EXISTS idx_job_dead_letter_type_created ON job_dead_letter(type, created_at)");
-  await prisma.$executeRawUnsafe(`
-    CREATE TABLE IF NOT EXISTS worker_heartbeat (
-      worker_id TEXT PRIMARY KEY,
-      status TEXT NOT NULL DEFAULT 'idle',
-      last_seen_at TEXT NOT NULL,
-      started_at TEXT,
-      last_error TEXT,
-      last_result_json TEXT,
-      updated_at TEXT NOT NULL
-    )
-  `);
-  await prisma.$executeRawUnsafe("CREATE INDEX IF NOT EXISTS idx_worker_heartbeat_last_seen ON worker_heartbeat(last_seen_at)");
 }
 
 export async function enqueueJob({
@@ -363,23 +314,6 @@ async function completeJob(id, result = {}) {
   );
 }
 
-async function moveToDeadLetter(id, { reason = "max_attempts_exhausted" } = {}) {
-  const config = deadLetterConfig();
-  if (!config.enabled) return;
-  const now = nowIso();
-  const safeReason = String(reason || "unknown").slice(0, DEAD_LETTER_REASON_MAX);
-  await prisma.$executeRawUnsafe(
-    `INSERT INTO job_dead_letter
-      (id, job_id, type, shop, payload_json, attempts, max_attempts, error_message, reason, failed_at, created_at)
-     SELECT
-      ${sqlQuote(crypto.randomUUID())}, id, type, shop, payload_json, attempts, max_attempts, error_message,
-      ${sqlQuote(safeReason)}, ${sqlQuote(now)}, ${sqlQuote(now)}
-     FROM job_queue
-     WHERE id = ${sqlQuote(id)}
-     LIMIT 1`,
-  );
-}
-
 async function failJob(id, { error, attempts, maxAttempts, retryDelaySeconds = 30 }) {
   const safeAttempts = Number(attempts || 0);
   const safeMaxAttempts = Math.max(1, Number(maxAttempts || 3));
@@ -400,165 +334,7 @@ async function failJob(id, { error, attempts, maxAttempts, retryDelaySeconds = 3
            completed_at = ${sqlQuote(now)}, updated_at = ${sqlQuote(now)}
        WHERE id = ${sqlQuote(id)}`,
     );
-    await moveToDeadLetter(id, { reason: "max_attempts_exhausted" });
   }
-}
-
-export async function recordWorkerHeartbeat(workerId, data = {}) {
-  await ensureJobQueueTable();
-  const now = nowIso();
-  const safeWorkerId = sanitizeWorkerId(workerId);
-  const status = String(data.status || "active").slice(0, 24);
-  const startedAt = toIso(data.startedAt || now);
-  const lastSeenAt = toIso(data.lastSeenAt || now);
-  const lastError = data.lastError == null ? null : String(data.lastError).slice(0, 1000);
-  const lastResultJson = safeJsonStringify(data.lastResult || null);
-
-  await prisma.$executeRawUnsafe(
-    `INSERT INTO worker_heartbeat (worker_id, status, last_seen_at, started_at, last_error, last_result_json, updated_at)
-     VALUES (
-       ${sqlQuote(safeWorkerId)}, ${sqlQuote(status)}, ${sqlQuote(lastSeenAt)},
-       ${sqlQuote(startedAt)}, ${sqlQuote(lastError)}, ${sqlQuote(lastResultJson)}, ${sqlQuote(now)}
-     )
-     ON CONFLICT(worker_id) DO UPDATE SET
-       status = EXCLUDED.status,
-       last_seen_at = EXCLUDED.last_seen_at,
-       last_error = EXCLUDED.last_error,
-       last_result_json = EXCLUDED.last_result_json,
-       updated_at = EXCLUDED.updated_at`,
-  );
-}
-
-export async function requeueStuckProcessingJobs({
-  staleMinutes = Math.max(2, Number(process.env.JOB_STUCK_REQUEUE_MINUTES || 15)),
-  limit = 50,
-} = {}) {
-  await ensureJobQueueTable();
-  const safeLimit = Math.max(1, Math.min(500, Number(limit) || 50));
-  const staleBefore = new Date(Date.now() - Math.max(1, Number(staleMinutes) || 15) * 60 * 1000).toISOString();
-  const rows = await prisma.$queryRawUnsafe(
-    `SELECT id, type, shop, attempts, max_attempts as maxAttempts, locked_at as lockedAt, error_message as errorMessage
-     FROM job_queue
-     WHERE status = ${sqlQuote(PROCESSING)}
-       AND locked_at IS NOT NULL
-       AND locked_at <= ${sqlQuote(staleBefore)}
-     ORDER BY locked_at ASC
-     LIMIT ${safeLimit}`,
-  );
-
-  let requeued = 0;
-  let deadLettered = 0;
-  for (const row of rows || []) {
-    const attempts = Number(row.attempts || 0);
-    const maxAttempts = Math.max(1, Number(row.maxAttempts || 3));
-    const now = nowIso();
-    const safeError = `Recovered from stale processing lock at ${row.lockedAt || "unknown"}; previous error: ${String(row.errorMessage || "none").slice(0, 400)}`;
-    if (attempts >= maxAttempts) {
-      // eslint-disable-next-line no-await-in-loop
-      await prisma.$executeRawUnsafe(
-        `UPDATE job_queue
-         SET status = ${sqlQuote(FAILED)}, completed_at = ${sqlQuote(now)}, updated_at = ${sqlQuote(now)},
-             error_message = ${sqlQuote(safeError)}
-         WHERE id = ${sqlQuote(row.id)} AND status = ${sqlQuote(PROCESSING)}`,
-      );
-      // eslint-disable-next-line no-await-in-loop
-      await moveToDeadLetter(row.id, { reason: "stuck_processing_exhausted" });
-      deadLettered += 1;
-    } else {
-      // eslint-disable-next-line no-await-in-loop
-      await prisma.$executeRawUnsafe(
-        `UPDATE job_queue
-         SET status = ${sqlQuote(QUEUED)}, locked_at = NULL, locked_by = NULL, run_after = ${sqlQuote(now)},
-             updated_at = ${sqlQuote(now)}, error_message = ${sqlQuote(safeError)}
-         WHERE id = ${sqlQuote(row.id)} AND status = ${sqlQuote(PROCESSING)}`,
-      );
-      requeued += 1;
-    }
-  }
-
-  return {
-    scanned: Number(rows?.length || 0),
-    requeued,
-    deadLettered,
-    staleBefore,
-  };
-}
-
-export async function cleanupDeadLetter({ retentionDays = null } = {}) {
-  await ensureJobQueueTable();
-  const config = deadLetterConfig();
-  const safeDays = Math.max(1, Number(retentionDays || config.retentionDays));
-  const cutoff = new Date(Date.now() - safeDays * 24 * 60 * 60 * 1000).toISOString();
-  const deleted = await prisma.$executeRawUnsafe(
-    `DELETE FROM job_dead_letter WHERE created_at < ${sqlQuote(cutoff)}`,
-  );
-  return { deleted: Number(deleted || 0), cutoff, retentionDays: safeDays };
-}
-
-export async function getWorkerHeartbeatSummary() {
-  await ensureJobQueueTable();
-  const staleMinutes = heartbeatConfig().staleMinutes;
-  const staleBefore = new Date(Date.now() - staleMinutes * 60 * 1000).toISOString();
-  const rows = await prisma.$queryRawUnsafe(
-    `SELECT worker_id as workerId, status, last_seen_at as lastSeenAt, started_at as startedAt,
-            last_error as lastError, last_result_json as lastResultJson
-     FROM worker_heartbeat
-     ORDER BY last_seen_at DESC
-     LIMIT 100`,
-  );
-  const workers = (rows || []).map((row) => {
-    const isStale = !row.lastSeenAt || row.lastSeenAt < staleBefore;
-    return {
-      workerId: row.workerId,
-      status: row.status,
-      lastSeenAt: row.lastSeenAt,
-      startedAt: row.startedAt || null,
-      stale: isStale,
-      lastError: row.lastError || null,
-      lastResult: safeJsonParse(row.lastResultJson, null),
-    };
-  });
-  return {
-    staleMinutes,
-    activeWorkers: workers.filter((row) => !row.stale).length,
-    staleWorkers: workers.filter((row) => row.stale).length,
-    workers,
-  };
-}
-
-export async function getDeadLetterSummary({ shop = null, limit = 25, days = 7 } = {}) {
-  await ensureJobQueueTable();
-  const safeShop = shop ? String(shop).trim().toLowerCase() : null;
-  const safeLimit = Math.max(1, Math.min(250, Number(limit) || 25));
-  const since = new Date(Date.now() - Math.max(1, Number(days) || 7) * 24 * 60 * 60 * 1000).toISOString();
-  const whereShop = safeShop ? ` AND shop = ${sqlQuote(safeShop)} ` : "";
-
-  const [totalsRows, recentRows] = await Promise.all([
-    prisma.$queryRawUnsafe(
-      `SELECT COUNT(*) as total,
-              SUM(CASE WHEN created_at >= ${sqlQuote(since)} THEN 1 ELSE 0 END) AS recent_total
-       FROM job_dead_letter
-       WHERE 1=1 ${whereShop}`,
-    ),
-    prisma.$queryRawUnsafe(
-      `SELECT job_id as jobId, type, shop, attempts, max_attempts as maxAttempts, error_message as errorMessage,
-              reason, failed_at as failedAt, created_at as createdAt
-       FROM job_dead_letter
-       WHERE 1=1 ${whereShop}
-       ORDER BY created_at DESC
-       LIMIT ${safeLimit}`,
-    ),
-  ]);
-
-  return {
-    total: Number(totalsRows?.[0]?.total || 0),
-    recentTotal: Number(totalsRows?.[0]?.recent_total || 0),
-    rows: (recentRows || []).map((row) => ({
-      ...row,
-      attempts: Number(row.attempts || 0),
-      maxAttempts: Number(row.maxAttempts || 0),
-    })),
-  };
 }
 
 export async function processQueueBatch({
@@ -567,21 +343,7 @@ export async function processQueueBatch({
   types = [],
   maxJobs = 20,
 } = {}) {
-  await ensureJobQueueTable();
-  const safeWorkerId = sanitizeWorkerId(workerId);
   const safeMaxJobs = Math.max(1, Math.min(200, Number(maxJobs) || 20));
-  const recovered = await requeueStuckProcessingJobs();
-  if (Number(recovered.requeued || 0) > 0 || Number(recovered.deadLettered || 0) > 0) {
-    logWarn("jobs.stuck.recovered", { workerId: safeWorkerId, ...recovered });
-  }
-  await cleanupDeadLetter();
-  await recordWorkerHeartbeat(safeWorkerId, {
-    status: "active",
-    startedAt: nowIso(),
-    lastSeenAt: nowIso(),
-    lastResult: { stage: "before_batch", recovered },
-  });
-
   let attempted = 0;
   let processed = 0;
   let succeeded = 0;
@@ -590,7 +352,7 @@ export async function processQueueBatch({
 
   while (attempted < safeMaxJobs) {
     attempted += 1;
-    const job = await claimNextJob({ workerId: safeWorkerId, types });
+    const job = await claimNextJob({ workerId, types });
     if (!job) break;
 
     processed += 1;
@@ -630,19 +392,11 @@ export async function processQueueBatch({
     }
   }
 
-  await recordWorkerHeartbeat(safeWorkerId, {
-    status: "idle",
-    lastSeenAt: nowIso(),
-    lastResult: { processed, succeeded, failed },
-    lastError: failed > 0 ? `${failed} job(s) failed in last batch` : null,
-  });
-
   return {
-    workerId: safeWorkerId,
+    workerId,
     processed,
     succeeded,
     failed,
-    recoveredStuck: recovered,
     results,
   };
 }

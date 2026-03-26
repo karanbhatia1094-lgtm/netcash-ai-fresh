@@ -1,6 +1,5 @@
 import { buildMonitoringOverview } from "../utils/monitoring.server";
 import { dispatchMonitoringAlert } from "../utils/alert-dispatch.server";
-import { scheduleAutonomousRepairs } from "../utils/autonomous-ops.server";
 
 function json(data, init = {}) {
   return new Response(JSON.stringify(data), {
@@ -34,16 +33,10 @@ async function run(request) {
   const windowMinutes = Math.max(5, Math.min(24 * 60, Number(url.searchParams.get("windowMinutes") || 60)));
   const syncDays = Math.max(1, Math.min(90, Number(url.searchParams.get("syncDays") || 7)));
   const force = String(url.searchParams.get("force") || "").toLowerCase() === "true";
-  const autoRepairRequested = ["1", "true", "yes", "on"].includes(String(url.searchParams.get("autoRepair") || "true").toLowerCase());
   const overview = await buildMonitoringOverview({ windowMinutes, syncDays });
-  const autoRepairEnabled = String(process.env.AUTO_REPAIR_ENABLED || "true").toLowerCase() !== "false";
-  let repair = null;
-  if (autoRepairRequested && autoRepairEnabled) {
-    repair = await scheduleAutonomousRepairs({ source: "monitoring_alerts" });
-  }
 
   if (!overview.alerts.any && !force) {
-    return json({ ok: true, sent: false, reason: "No active alerts", overview, repair });
+    return json({ ok: true, sent: false, reason: "No active alerts", overview });
   }
 
   const dispatch = await dispatchMonitoringAlert({
@@ -55,7 +48,6 @@ async function run(request) {
     sent: dispatch.ok,
     dispatch,
     overview,
-    repair,
   }, { status: dispatch.ok ? 200 : 502 });
 }
 

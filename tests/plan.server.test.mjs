@@ -1,11 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {
-  detectTierFromSubscriptions,
-  featureFlagsForTier,
-  PLAN_TIERS,
-  resolvePremiumOverrideForShop,
-} from "../app/utils/plan.server.js";
+import { detectTierFromSubscriptions, featureFlagsForTier, PLAN_TIERS } from "../app/utils/plan.server.js";
 
 test("detectTierFromSubscriptions resolves premium over pro/basic", () => {
   const tier = detectTierFromSubscriptions([
@@ -40,23 +35,4 @@ test("featureFlagsForTier returns expected flags", () => {
     hasPro: true,
     hasPremium: true,
   });
-});
-
-test("resolvePremiumOverrideForShop matches PREMIUM_SHOPS entries", () => {
-  const previous = process.env.PREMIUM_SHOPS;
-  process.env.PREMIUM_SHOPS = "demo.myshopify.com, other.myshopify.com";
-
-  const hit = resolvePremiumOverrideForShop("Demo.MyShopify.com");
-  const miss = resolvePremiumOverrideForShop("missing.myshopify.com");
-
-  assert.equal(Boolean(hit), true);
-  assert.equal(hit?.hasActivePayment, true);
-  assert.equal(hit?.subscriptions?.[0]?.name?.includes("Premium Monthly"), true);
-  assert.equal(miss, null);
-
-  if (previous == null) {
-    delete process.env.PREMIUM_SHOPS;
-  } else {
-    process.env.PREMIUM_SHOPS = previous;
-  }
 });

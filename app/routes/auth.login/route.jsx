@@ -21,11 +21,6 @@ function normalizeShopDomain(value) {
   return normalized;
 }
 
-function isValidShopDomain(value) {
-  const shop = String(value || "").trim().toLowerCase();
-  return /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(shop);
-}
-
 function decodeBase64Url(value) {
   const input = String(value || "").trim();
   if (!input) return "";
@@ -38,68 +33,43 @@ function decodeBase64Url(value) {
   }
 }
 
-async function inferShopFromRequest(request, url) {
+function inferShopFromRequest(request, url) {
   const directShop = normalizeShopDomain(url.searchParams.get("shop"));
-  if (isValidShopDomain(directShop)) return directShop;
+  if (directShop) return directShop;
 
   const hostParam = String(url.searchParams.get("host") || "").trim();
   const decodedHost = decodeBase64Url(hostParam);
   const hostMatch = decodedHost.match(/\/store\/([a-z0-9-]+)/i);
-  if (hostMatch?.[1]) {
-    const inferred = normalizeShopDomain(`${hostMatch[1]}.myshopify.com`);
-    if (isValidShopDomain(inferred)) return inferred;
-  }
+  if (hostMatch?.[1]) return normalizeShopDomain(`${hostMatch[1]}.myshopify.com`);
 
   const referer = String(request.headers.get("referer") || "");
   const refererMatch = referer.match(/\/store\/([a-z0-9-]+)/i);
-  if (refererMatch?.[1]) {
-    const inferred = normalizeShopDomain(`${refererMatch[1]}.myshopify.com`);
-    if (isValidShopDomain(inferred)) return inferred;
-  }
-
-  const defaultShop = normalizeShopDomain(process.env.SHOPIFY_SHOP_DOMAIN || process.env.AUTOPILOT_SHOP || "");
-  if (isValidShopDomain(defaultShop)) return defaultShop;
-
-  try {
-    const { prisma } = await import("../../utils/db.server");
-    const recentSession = await prisma.session.findFirst({
-      where: { accessToken: { not: null } },
-      select: { shop: true },
-      orderBy: { id: "desc" },
-    });
-    const sessionShop = normalizeShopDomain(recentSession?.shop || "");
-    if (isValidShopDomain(sessionShop)) return sessionShop;
-  } catch {
-    // Ignore DB discovery failures and fall back to manual entry UI.
-  }
+  if (refererMatch?.[1]) return normalizeShopDomain(`${refererMatch[1]}.myshopify.com`);
 
   return "";
 }
 
 export const loader = async ({ request }) => {
-  const url = new URL(request.url);
-  const shop = await inferShopFromRequest(request, url);
-  if (shop) {
-    throw redirect(`/auth?shop=${encodeURIComponent(shop)}`);
-  }
-
   const loginResult = await login(request);
   if (loginResult instanceof Response) {
     return loginResult;
   }
+  const url = new URL(request.url);
+  const shop = inferShopFromRequest(request, url);
+  if (shop) {
+    throw redirect(`/auth?shop=${encodeURIComponent(shop)}`);
+  }
+  const errors = loginErrorMessage(loginResult);
 
-  return { errors: {}, shop };
+  return { errors, shop };
 };
 
 export const action = async ({ request }) => {
   const formData = await request.clone().formData();
   const normalizedShop = normalizeShopDomain(formData.get("shop"));
 
-  if (isValidShopDomain(normalizedShop)) {
-    throw redirect(`/auth?shop=${encodeURIComponent(normalizedShop)}`);
-  }
   if (normalizedShop) {
-    return { errors: { shop: "Please enter a valid .myshopify.com domain" } };
+    throw redirect(`/auth?shop=${encodeURIComponent(normalizedShop)}`);
   }
 
   const loginResult = await login(request);

@@ -1,5 +1,4 @@
-import { Form, useActionData, useLoaderData, useRouteError, isRouteErrorResponse, Link, useFetcher } from "@remix-run/react";
-import { useState } from "react";
+import { Form, useActionData, useLoaderData, useRouteError, isRouteErrorResponse, Link } from "@remix-run/react";
 import { redirect } from "@remix-run/node";
 import { authenticate } from "../shopify.server";
 import {
@@ -19,7 +18,6 @@ import {
   recordOnboardingProgressSnapshot,
 } from "../utils/onboarding-progress.server";
 import { recordFeatureUsageEvent } from "../utils/feature-usage.server";
-import { listIntegrationRequests } from "../utils/integration-requests.server";
 
 const CHANNELS = ["whatsapp", "email", "sms", "rcs"];
 const DEFAULT_CHANNELS_CSV = CHANNELS.join(",");
@@ -238,7 +236,6 @@ export async function loader({ request }) {
     },
   }).catch(() => {});
   const onboardingHistory = await listOnboardingProgressHistory(session.shop, 8).catch(() => []);
-  const integrationRequests = await listIntegrationRequests(session.shop, 8).catch(() => []);
   const firstValueScore = Math.round(
     ((connectors.meta || connectors.google ? 35 : 0)
       + (destinations.length > 0 ? 25 : 0)
@@ -262,8 +259,6 @@ export async function loader({ request }) {
     allowedChannels,
     connectorActionsEnabled,
     missingChannels,
-    integrationRequests,
-    credentials,
   };
 }
 
@@ -464,35 +459,7 @@ export default function IntegrationsHubPage() {
     firstValueScore,
     allowedChannels,
     connectorActionsEnabled,
-    integrationRequests,
-    credentials,
   } = useLoaderData();
-  const connectorMap = new Map((credentials || []).map((row) => [row.provider, row]));
-  const parseMetadata = (value) => {
-    if (!value) return {};
-    try {
-      return JSON.parse(value);
-    } catch {
-      return {};
-    }
-  };
-  const deliveryConnectors = [
-    { key: "shiprocket", label: "Shiprocket", kind: "delivery" },
-    { key: "delhivery", label: "Delhivery", kind: "delivery" },
-    { key: "shipway", label: "Shipway", kind: "delivery" },
-    { key: "bluedart", label: "Bluedart", kind: "delivery" },
-    { key: "returns_prime", label: "Returns Prime", kind: "delivery" },
-  ];
-  const omsConnectors = [
-    { key: "unicommerce", label: "Unicommerce", kind: "oms" },
-    { key: "easycom", label: "Easycom", kind: "oms" },
-  ];
-  const [deliveryProviders, setDeliveryProviders] = useState([]);
-  const [omsProviders, setOmsProviders] = useState([]);
-  const [integrationNotes, setIntegrationNotes] = useState("");
-  const [integrationToast, setIntegrationToast] = useState("");
-  const integrationFetcher = useFetcher();
-  const credentialFetcher = useFetcher();
   const actionData = useActionData();
   const setupResults = Array.isArray(actionData?.result?.setupResults) ? actionData.result.setupResults : [];
   const successCount = setupResults.filter((row) => row.ok).length;
@@ -533,312 +500,6 @@ export default function IntegrationsHubPage() {
         <div className="nc-kpi-card"><div className="nc-muted">First Value Score</div><div className="nc-kpi-value">{firstValueScore}%</div></div>
         <div className="nc-kpi-card"><div className="nc-muted">Allowed Channels</div><div className="nc-kpi-value">{allowedChannels.join(", ")}</div></div>
         <div className="nc-kpi-card"><div className="nc-muted">Connector Actions</div><div className="nc-kpi-value">{connectorActionsEnabled ? "Enabled" : "Disabled"}</div></div>
-      </div>
-
-      <div id="delivery-integration-guide" className="nc-card nc-section nc-glass nc-integration-onboard" style={{ marginTop: "14px" }}>
-        <div className="nc-section-head-inline">
-          <div>
-            <h2 style={{ marginBottom: "4px" }}>Delivery + OMS Integrations</h2>
-            <p className="nc-note" style={{ margin: 0 }}>
-              Plug in your logistics stack in minutes. Netcash.ai will sync delivery status, RTO, re-attempts, and OMS fulfillment updates.
-            </p>
-          </div>
-          <div className="nc-toolbar" style={{ marginBottom: 0 }}>
-            <button
-              type="button"
-              className="nc-btn-primary"
-              onClick={() => {
-                setIntegrationToast("Select providers below, then click Connect Selected.");
-                setTimeout(() => setIntegrationToast(""), 2200);
-              }}
-            >
-              Request Assisted Setup
-            </button>
-            <button
-              type="button"
-              className="nc-btn-secondary"
-              onClick={() => {
-                setIntegrationToast("Use sample payloads or send live webhooks to test.");
-                setTimeout(() => setIntegrationToast(""), 2200);
-              }}
-            >
-              Test with Sample Data
-            </button>
-          </div>
-        </div>
-
-        <div className="nc-grid-3" style={{ marginTop: "12px" }}>
-          <div className="nc-soft-box">
-            <strong>Step 1: Choose provider</strong>
-            <p className="nc-note">Select your delivery and OMS providers from the list below.</p>
-          </div>
-          <div className="nc-soft-box">
-            <strong>Step 2: Connect or send data</strong>
-            <p className="nc-note">Use OAuth/API credentials or send webhook events to the ingest endpoints.</p>
-          </div>
-          <div className="nc-soft-box">
-            <strong>Step 3: Verify updates</strong>
-            <p className="nc-note">Track delivery/RTO health on the Home dashboard within minutes.</p>
-          </div>
-        </div>
-
-        <integrationFetcher.Form method="post" action="/api/integrations/request">
-          <div className="nc-grid-2" style={{ marginTop: "12px" }}>
-            <div className="nc-soft-box nc-provider-card">
-            <div className="nc-provider-header">
-              <strong>Delivery Providers</strong>
-              <span className="nc-chip">Plug-and-Play</span>
-            </div>
-            <div className="nc-provider-list">
-              {["Shiprocket", "Delhivery", "NimbusPost", "Ecom Express", "Shadowfax", "DTDC", "Blue Dart", "Xpressbees"].map((name) => (
-                <label key={`delivery-${name}`} className="nc-provider-item">
-                  <input
-                    type="checkbox"
-                    name="providers"
-                    value={name.toLowerCase().replace(/\s+/g, "_")}
-                    checked={deliveryProviders.includes(name)}
-                    onChange={(event) => {
-                      const next = event.target.checked
-                        ? [...deliveryProviders, name]
-                        : deliveryProviders.filter((item) => item !== name);
-                      setDeliveryProviders(next);
-                    }}
-                  />
-                  <span>{name}</span>
-                </label>
-              ))}
-            </div>
-            <p className="nc-note" style={{ marginTop: "8px" }}>Fields: AWB, status timeline, RTO status, re-attempt count, delivery timestamps.</p>
-          </div>
-          <div className="nc-soft-box nc-provider-card">
-            <div className="nc-provider-header">
-              <strong>OMS Providers</strong>
-              <span className="nc-chip">Plug-and-Play</span>
-            </div>
-            <div className="nc-provider-list">
-              {["Unicommerce", "Easycom", "Vinculum", "Increff", "Uniware", "ClickPost"].map((name) => (
-                <label key={`oms-${name}`} className="nc-provider-item">
-                  <input
-                    type="checkbox"
-                    name="providers"
-                    value={name.toLowerCase().replace(/\s+/g, "_")}
-                    checked={omsProviders.includes(name)}
-                    onChange={(event) => {
-                      const next = event.target.checked
-                        ? [...omsProviders, name]
-                        : omsProviders.filter((item) => item !== name);
-                      setOmsProviders(next);
-                    }}
-                  />
-                  <span>{name}</span>
-                </label>
-              ))}
-            </div>
-            <p className="nc-note" style={{ marginTop: "8px" }}>Fields: order status, sub-status, fulfillment status, last updated time.</p>
-          </div>
-          </div>
-          <div className="nc-toolbar" style={{ marginTop: "10px" }}>
-            <input type="hidden" name="category" value="delivery_oms" />
-            <input type="hidden" name="notes" value={integrationNotes} />
-            <button type="submit" className="nc-btn-primary">Connect Selected</button>
-            <button
-              type="button"
-              className="nc-btn-secondary"
-              onClick={() => {
-                setDeliveryProviders([]);
-                setOmsProviders([]);
-                setIntegrationNotes("");
-              }}
-            >
-              Clear Selection
-            </button>
-          </div>
-          <div style={{ marginTop: "8px" }}>
-            <label className="nc-form-field">Notes or credentials (optional)
-              <textarea
-                value={integrationNotes}
-                onChange={(event) => setIntegrationNotes(event.target.value)}
-                placeholder="Add account IDs, login email, or special instructions."
-              />
-            </label>
-          </div>
-        </integrationFetcher.Form>
-
-        {integrationFetcher.data?.ok ? (
-          <p className="nc-note" style={{ marginTop: "10px", color: "#0d6e4f", fontWeight: 700 }}>
-            Request sent. We will reach out to finalize setup.
-          </p>
-        ) : null}
-        {integrationFetcher.data?.error ? (
-          <p className="nc-danger" style={{ marginTop: "10px" }}>{integrationFetcher.data.error}</p>
-        ) : null}
-        {integrationToast ? (
-          <p className="nc-note" style={{ marginTop: "8px" }}>{integrationToast}</p>
-        ) : null}
-
-        {integrationRequests.length > 0 ? (
-          <div className="nc-soft-box" style={{ marginTop: "12px" }}>
-            <strong>Recent integration requests</strong>
-            <table className="nc-table-card" style={{ marginTop: "8px" }}>
-              <thead>
-                <tr>
-                  <th style={{ textAlign: "left" }}>Provider</th>
-                  <th style={{ textAlign: "left" }}>Category</th>
-                  <th style={{ textAlign: "left" }}>Status</th>
-                  <th style={{ textAlign: "left" }}>Requested</th>
-                </tr>
-              </thead>
-              <tbody>
-                {integrationRequests.map((row) => (
-                  <tr key={`integration-request-${row.id}`}>
-                    <td>{String(row.provider || "").replace(/_/g, " ")}</td>
-                    <td>{row.category}</td>
-                    <td>{row.status}</td>
-                    <td>{row.created_at ? new Date(row.created_at).toLocaleString() : "-"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ) : null}
-
-        <div className="nc-soft-box" style={{ marginTop: "12px" }}>
-          <strong>Ingestion endpoints</strong>
-          <p className="nc-note" style={{ marginBottom: "6px" }}>
-            Delivery updates: <code>/api/delivery/ingest</code> | OMS updates: <code>/api/oms/ingest</code>
-          </p>
-          <p className="nc-note">
-            Auth header: <code>x-netcash-ingest-key</code> (required if <code>NETCASH_INGEST_KEY</code> is set).
-          </p>
-        </div>
-
-        <div className="nc-card nc-section nc-glass" style={{ marginTop: "12px" }}>
-          <h3 style={{ marginTop: 0 }}>Connector Setup (API key + pull sync)</h3>
-          <p className="nc-note">
-            Add provider credentials and trigger a pull sync. For OAuth-based providers, share the OAuth credentials and we will wire the flow.
-          </p>
-          {credentialFetcher.data?.ok ? (
-            <p className="nc-note" style={{ color: "#0d6e4f", fontWeight: 700 }}>
-              Connector saved. Sync queued.
-            </p>
-          ) : null}
-          {credentialFetcher.data?.error ? (
-            <p className="nc-danger">{credentialFetcher.data.error}</p>
-          ) : null}
-          <div className="nc-grid-2">
-            {deliveryConnectors.map((connector) => {
-              const cred = connectorMap.get(connector.key);
-              const meta = parseMetadata(cred?.metadata);
-              return (
-                <div key={`delivery-connector-${connector.key}`} className="nc-soft-box nc-provider-card">
-                  <div className="nc-provider-header">
-                    <strong>{connector.label}</strong>
-                    <span className="nc-chip">{cred?.accessToken ? "Connected" : "Not connected"}</span>
-                  </div>
-                  <credentialFetcher.Form method="post" action="/api/connectors/credentials" className="nc-form-stack">
-                    <input type="hidden" name="provider" value={connector.key} />
-                    <input type="hidden" name="kind" value={connector.kind} />
-                    <label className="nc-form-field">API base URL
-                      <input name="baseUrl" defaultValue={meta.baseUrl || ""} placeholder="https://api.provider.com" />
-                    </label>
-                    <label className="nc-form-field">Endpoint path (optional)
-                      <input name="endpoint" defaultValue={meta.endpoint || ""} placeholder="/shipments/status" />
-                    </label>
-                    <label className="nc-form-field">API key / token
-                      <input name="apiKey" defaultValue={meta.apiKey || ""} placeholder="Paste token" />
-                    </label>
-                    <div className="nc-grid-2">
-                      <label className="nc-form-field">Auth header
-                        <input name="authHeaderName" defaultValue={meta.authHeaderName || "Authorization"} />
-                      </label>
-                      <label className="nc-form-field">Auth prefix
-                        <input name="authPrefix" defaultValue={meta.authPrefix || "Bearer"} />
-                      </label>
-                    </div>
-                    <label className="nc-form-field">
-                      <input type="checkbox" name="runNow" value="true" defaultChecked />
-                      Run sync after save
-                    </label>
-                    <button type="submit" className="nc-btn-primary">Save & Sync</button>
-                  </credentialFetcher.Form>
-                </div>
-              );
-            })}
-          </div>
-          <div className="nc-grid-2" style={{ marginTop: "12px" }}>
-            {omsConnectors.map((connector) => {
-              const cred = connectorMap.get(connector.key);
-              const meta = parseMetadata(cred?.metadata);
-              return (
-                <div key={`oms-connector-${connector.key}`} className="nc-soft-box nc-provider-card">
-                  <div className="nc-provider-header">
-                    <strong>{connector.label}</strong>
-                    <span className="nc-chip">{cred?.accessToken ? "Connected" : "Not connected"}</span>
-                  </div>
-                  <credentialFetcher.Form method="post" action="/api/connectors/credentials" className="nc-form-stack">
-                    <input type="hidden" name="provider" value={connector.key} />
-                    <input type="hidden" name="kind" value={connector.kind} />
-                    <label className="nc-form-field">API base URL
-                      <input name="baseUrl" defaultValue={meta.baseUrl || ""} placeholder="https://api.provider.com" />
-                    </label>
-                    <label className="nc-form-field">Endpoint path (optional)
-                      <input name="endpoint" defaultValue={meta.endpoint || ""} placeholder="/orders/status" />
-                    </label>
-                    <label className="nc-form-field">API key / token
-                      <input name="apiKey" defaultValue={meta.apiKey || ""} placeholder="Paste token" />
-                    </label>
-                    <div className="nc-grid-2">
-                      <label className="nc-form-field">Auth header
-                        <input name="authHeaderName" defaultValue={meta.authHeaderName || "Authorization"} />
-                      </label>
-                      <label className="nc-form-field">Auth prefix
-                        <input name="authPrefix" defaultValue={meta.authPrefix || "Bearer"} />
-                      </label>
-                    </div>
-                    <label className="nc-form-field">
-                      <input type="checkbox" name="runNow" value="true" defaultChecked />
-                      Run sync after save
-                    </label>
-                    <button type="submit" className="nc-btn-primary">Save & Sync</button>
-                  </credentialFetcher.Form>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
-        <details style={{ marginTop: "12px" }}>
-          <summary><strong>Show sample payloads</strong></summary>
-          <pre className="nc-code-block" style={{ marginTop: "8px" }}>
-{`POST /api/delivery/ingest
-{
-  "shop": "${shop}",
-  "provider": "shiprocket",
-  "orderId": "1234567890",
-  "orderNumber": "#1001",
-  "awb": "SR123456",
-  "status": "in_transit",
-  "statusDetail": "Arrived at hub",
-  "attemptCount": 1,
-  "events": [
-    { "event": "Picked", "eventAt": "2026-03-10T07:10:00Z", "location": "Delhi" },
-    { "event": "In Transit", "eventAt": "2026-03-11T09:45:00Z", "location": "Jaipur" }
-  ]
-}
-
-POST /api/oms/ingest
-{
-  "shop": "${shop}",
-  "provider": "unicommerce",
-  "orderId": "1234567890",
-  "orderNumber": "#1001",
-  "status": "packed",
-  "subStatus": "ready_to_ship",
-  "fulfillmentStatus": "partially_fulfilled",
-  "lastEventAt": "2026-03-11T08:10:00Z"
-}`}
-          </pre>
-        </details>
       </div>
 
       <div className="nc-card nc-section nc-glass nc-next-action" style={{ marginTop: "12px" }}>

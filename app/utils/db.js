@@ -856,11 +856,9 @@ export async function upsertToolAttribution({
   });
 }
 
-export async function getOrders(shop, days = 365, options = {}) {
+export async function getOrders(shop, days = 365) {
   const sinceDate = new Date();
   sinceDate.setDate(sinceDate.getDate() - Number(days));
-  const safeLimit = Math.max(1, Number(options?.limit || 0));
-  const useLimit = Number.isFinite(safeLimit) && safeLimit > 0;
 
   try {
     return await prisma.netCashOrder.findMany({
@@ -877,7 +875,6 @@ export async function getOrders(shop, days = 365, options = {}) {
       orderBy: {
         createdAt: "desc",
       },
-      ...(useLimit ? { take: safeLimit } : {}),
     });
   } catch (error) {
     if (!isSchemaMismatchError(error)) throw error;
@@ -891,7 +888,6 @@ export async function getOrders(shop, days = 365, options = {}) {
       orderBy: {
         createdAt: "desc",
       },
-      ...(useLimit ? { take: safeLimit } : {}),
     });
   }
 }
