@@ -132,6 +132,31 @@ model MarketingSpendEntry {
   @@index([spendDate])
 }
 
+model CreativeMetricDaily {
+  id           Int      @id @default(autoincrement())
+  shop         String
+  source       String
+  adId         String
+  adName       String?
+  adSetId      String?
+  adSetName    String?
+  campaignId   String?
+  campaignName String?
+  reportDate   DateTime
+  impressions  Int      @default(0)
+  clicks       Int      @default(0)
+  spend        Float    @default(0)
+  ctr          Float    @default(0)
+  frequency    Float?
+  conversions  Float    @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([shop, source, adId, reportDate])
+  @@index([shop, source, reportDate])
+  @@index([shop, campaignId])
+}
+
 model ConnectorCredential {
   id           Int      @id @default(autoincrement())
   shop         String

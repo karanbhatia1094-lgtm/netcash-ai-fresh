@@ -1,5 +1,6 @@
 import { json } from "@remix-run/node";
 import { ingestUniversalSignalEvents } from "../utils/db.server";
+import { enforceRateLimit } from "../utils/rate-limit.server";
 
 function isAuthorized(request) {
   const required = process.env.ATTRIBUTION_API_KEY;
@@ -12,6 +13,8 @@ export async function action({ request }) {
   if (request.method !== "POST") {
     return json({ ok: false, error: "Method not allowed" }, { status: 405 });
   }
+  const rateLimited = enforceRateLimit(request, { key: "api:universal_signals", limit: 300, windowMs: 60_000 });
+  if (rateLimited) return rateLimited;
   if (!isAuthorized(request)) {
     return json({ ok: false, error: "Unauthorized" }, { status: 401 });
   }

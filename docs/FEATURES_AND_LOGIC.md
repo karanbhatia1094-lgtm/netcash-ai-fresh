@@ -200,6 +200,27 @@
   - `docs/ARCHITECTURE_PITCH_DECK.md`
   - `docs/SALES_PITCH_DECK.md`
 
+## 19) Attribution Overlap + Landing Mismatch Diagnostics
+- Feature:
+  - Highlights multi-source attribution overlap and landing mismatch risk for paid traffic.
+- Logic:
+  - Overlap risk = orders with touchpoints across multiple sources.
+  - Landing mismatch = paid orders landing on home or generic pages.
+- Sources used:
+  - `app/routes/app._index.jsx`
+  - `app/utils/db.js` (touchpoints + landing signal capture)
+
+## 20) Creative Fatigue Watchlist
+- Feature:
+  - Detects CTR decay and frequency pressure at creative level across Meta/Google.
+- Logic:
+  - Pulls daily creative metrics, compares last 7 days vs prior 7 days.
+  - Flags creatives with CTR drop + spend/impression thresholds and age/frequency checks.
+- Sources used:
+  - `app/utils/connector-sync.server.js` (creative metrics sync)
+  - `app/utils/db.js` (fatigue scoring + alerts)
+  - `app/routes/app.campaigns.jsx` (watchlist UI)
+
 ---
 
 ## Notes on “Triple Whale parity”

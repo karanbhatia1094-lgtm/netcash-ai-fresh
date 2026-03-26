@@ -29,7 +29,7 @@ BEGIN
 END $$;
 `;
 
-const result = spawnSync("npx prisma db execute --stdin --schema prisma/schema.postgres.prisma", {
+const result = spawnSync("npx prisma db execute --stdin --config prisma.config.postgres.ts", {
   input: sql,
   encoding: "utf8",
   shell: true,
@@ -38,7 +38,7 @@ const result = spawnSync("npx prisma db execute --stdin --schema prisma/schema.p
 const ok = result.status === 0;
 console.log(JSON.stringify({
   ok,
-  command: "npx prisma db execute --stdin --schema prisma/schema.postgres.prisma",
+  command: "npx prisma db execute --stdin --config prisma.config.postgres.ts",
   stdout: String(result.stdout || "").trim(),
   stderr: String(result.stderr || "").trim(),
   checkedAt: new Date().toISOString(),

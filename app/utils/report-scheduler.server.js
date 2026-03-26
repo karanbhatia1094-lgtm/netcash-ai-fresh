@@ -1,7 +1,8 @@
 import { prisma } from "../../prisma.client.js";
+import { getCreativeFatigueRisks } from "./db.server";
 import { logError, logInfo, logWarn } from "./logger.server";
 
-const ALLOWED_PAGES = new Set(["home", "campaigns", "alerts"]);
+const ALLOWED_PAGES = new Set(["home", "campaigns", "alerts", "growth"]);
 const ALLOWED_FREQUENCIES = new Set(["daily", "weekly"]);
 const ALLOWED_FORMATS = new Set(["csv", "pdf", "both"]);
 
@@ -64,6 +65,53 @@ function nextRunFor(frequency, fromDate = new Date()) {
   return frequency === "daily" ? addDays(fromDate, 1) : addDays(fromDate, 7);
 }
 
+function weekdayIndex(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return null;
+  const map = {
+    sunday: 0,
+    monday: 1,
+    tuesday: 2,
+    wednesday: 3,
+    thursday: 4,
+    friday: 5,
+    saturday: 6,
+  };
+  if (normalized in map) return map[normalized];
+  const numeric = Number(normalized);
+  if (Number.isFinite(numeric) && numeric >= 0 && numeric <= 6) return numeric;
+  return null;
+}
+
+function nextWeeklyAt(fromDate, dayIndex, hour = 10) {
+  const base = new Date(fromDate);
+  const currentDay = base.getDay();
+  const daysUntil = (dayIndex - currentDay + 7) % 7;
+  const candidate = addDays(base, daysUntil);
+  candidate.setHours(hour, 0, 0, 0);
+  if (candidate <= base) {
+    const next = addDays(candidate, 7);
+    next.setHours(hour, 0, 0, 0);
+    return next;
+  }
+  return candidate;
+}
+
+function nextRunForSchedule(frequency, fromDate, filters = {}) {
+  const preferredDay = weekdayIndex(filters?.preferred_day);
+  const preferredHour = Number(filters?.preferred_hour);
+  const hour = Number.isFinite(preferredHour) ? Math.min(23, Math.max(0, preferredHour)) : 10;
+  if (frequency === "weekly" && preferredDay != null) {
+    return nextWeeklyAt(fromDate, preferredDay, hour);
+  }
+  if (frequency === "daily" && Number.isFinite(preferredHour)) {
+    const next = new Date(fromDate);
+    next.setDate(next.getDate() + 1);
+    next.setHours(hour, 0, 0, 0);
+    return next;
+  }
+  return nextRunFor(frequency, fromDate);
+}
 function buildPdfBuffer(title, lines) {
   const width = 612;
   const height = 792;
@@ -176,7 +224,7 @@ export async function createReportSchedule({ shop, page, name, frequency, email,
   const safeEmailValue = safeEmail(email);
   const safeFormatValue = safeFormat(format);
   const now = new Date();
-  const nextRunAt = nextRunFor(safeFrequencyValue, now).toISOString();
+  const nextRunAt = nextRunForSchedule(safeFrequencyValue, now, filters).toISOString();
 
   await prisma.$executeRawUnsafe(
     `INSERT INTO report_schedule (shop, page, name, frequency, email, format, filters, is_active, next_run_at, created_at, updated_at)
@@ -236,7 +284,11 @@ async function recordDeliveryRun(scheduleId, status, message, metadata = {}) {
 
 async function bumpScheduleRun(schedule) {
   const now = new Date();
-  const nextRunAt = nextRunFor(safeFrequency(schedule.frequency), now).toISOString();
+  const nextRunAt = nextRunForSchedule(
+    safeFrequency(schedule.frequency),
+    now,
+    parseJson(schedule.filters, {}),
+  ).toISOString();
   await prisma.$executeRawUnsafe(
     `UPDATE report_schedule
      SET last_run_at = ?, next_run_at = ?, updated_at = CURRENT_TIMESTAMP
@@ -268,9 +320,28 @@ async function buildHomeReport(shop, filters) {
     orderBy: { createdAt: "desc" },
     take: 500,
   });
+  const spendRows = prisma.marketingSpendEntry
+    ? await prisma.marketingSpendEntry.findMany({
+        where: { spendDate: { gte: since } },
+      })
+    : [];
+  const creativeFatigue = await getCreativeFatigueRisks(shop, days, "all").catch(() => []);
   const gross = orders.reduce((sum, row) => sum + Number(row.grossValue || 0), 0);
   const net = orders.reduce((sum, row) => sum + Number(row.netCash || 0), 0);
+  const discount = orders.reduce((sum, row) => sum + Number(row.discountTotal || 0), 0);
+  const refund = orders.reduce((sum, row) => sum + Number(row.refundTotal || 0), 0);
+  const rtoCount = orders.filter((row) => row.isRTO || row.rtoTotal > 0).length;
   const count = orders.length;
+  const spend = spendRows.reduce((sum, row) => sum + Number(row.adSpend || 0), 0);
+  const blendedRoas = spend > 0 ? net / spend : 0;
+  const marginPct = gross > 0 ? (net / gross) * 100 : 0;
+  const discountPct = gross > 0 ? (discount / gross) * 100 : 0;
+  const refundPct = gross > 0 ? (refund / gross) * 100 : 0;
+  const rtoPct = count > 0 ? (rtoCount / count) * 100 : 0;
+  const attributionMissing = orders.filter(
+    (row) => !row.utmSource && !row.campaignId && !row.campaignName && !row.clickId,
+  ).length;
+  const attributionGapPct = count > 0 ? (attributionMissing / count) * 100 : 0;
   const topSourcesMap = new Map();
   for (const row of orders) {
     const source = String(row.marketingSource || "unmapped");
@@ -286,6 +357,14 @@ async function buildHomeReport(shop, filters) {
     ["Orders", count],
     ["Gross Revenue", gross.toFixed(2)],
     ["Net Cash", net.toFixed(2)],
+    ["Ad Spend", spend.toFixed(2)],
+    ["Blended ROAS", blendedRoas.toFixed(2)],
+    ["Margin %", marginPct.toFixed(1)],
+    ["Discount %", discountPct.toFixed(1)],
+    ["Refund %", refundPct.toFixed(1)],
+    ["RTO %", rtoPct.toFixed(1)],
+    ["Attribution Gap %", attributionGapPct.toFixed(1)],
+    ["Creative Fatigue Count", Array.isArray(creativeFatigue) ? creativeFatigue.length : 0],
     ["Generated At", new Date().toISOString()],
     [],
     ["Top Source", "Orders", "Net Cash"],
@@ -306,6 +385,9 @@ async function buildHomeReport(shop, filters) {
     `Orders: ${count}`,
     `Gross Revenue: INR ${gross.toFixed(2)}`,
     `Net Cash: INR ${net.toFixed(2)}`,
+    `Ad Spend: INR ${spend.toFixed(2)} | Blended ROAS: ${blendedRoas.toFixed(2)}x`,
+    `Margin: ${marginPct.toFixed(1)}% | Discount: ${discountPct.toFixed(1)}% | Refund: ${refundPct.toFixed(1)}% | RTO: ${rtoPct.toFixed(1)}%`,
+    `Attribution Gap: ${attributionGapPct.toFixed(1)}% | Creative Fatigue: ${Array.isArray(creativeFatigue) ? creativeFatigue.length : 0}`,
     "",
     "Top Sources:",
     ...topSources.map((row) => `- ${row.source}: ${row.orders} orders, INR ${row.netCash.toFixed(2)} net`),
@@ -413,11 +495,69 @@ async function buildAlertsReport(shop, filters) {
   return { title: `Netcash Alerts Report (${days}d)`, csv, pdfLines };
 }
 
+export async function buildGrowthReport(shop, filters) {
+  const days = Math.max(7, Math.min(90, Number(filters?.days || 7)));
+  const since = addDays(new Date(), -days);
+  const orders = await prisma.netCashOrder.findMany({
+    where: { shop, createdAt: { gte: since } },
+    orderBy: { createdAt: "desc" },
+  });
+  const spendRows = prisma.marketingSpendEntry
+    ? await prisma.marketingSpendEntry.findMany({
+        where: { spendDate: { gte: since } },
+      })
+    : [];
+  const creativeFatigue = await getCreativeFatigueRisks(shop, days, "all").catch(() => []);
+
+  const gross = orders.reduce((sum, row) => sum + (row.grossValue || 0), 0);
+  const net = orders.reduce((sum, row) => sum + (row.netCash || 0), 0);
+  const discount = orders.reduce((sum, row) => sum + (row.discountTotal || 0), 0);
+  const refund = orders.reduce((sum, row) => sum + (row.refundTotal || 0), 0);
+  const rtoCount = orders.filter((row) => row.isRTO).length;
+  const orderCount = orders.length;
+  const spend = spendRows.reduce((sum, row) => sum + (row.adSpend || 0), 0);
+  const blendedRoas = spend > 0 ? net / spend : 0;
+  const marginPct = gross > 0 ? (net / gross) * 100 : 0;
+  const discountPct = gross > 0 ? (discount / gross) * 100 : 0;
+  const refundPct = gross > 0 ? (refund / gross) * 100 : 0;
+  const rtoPct = orderCount > 0 ? (rtoCount / orderCount) * 100 : 0;
+  const attributionMissing = orders.filter((row) => !row.utmSource && !row.campaignId && !row.campaignName && !row.clickId).length;
+  const attributionGapPct = orderCount > 0 ? (attributionMissing / orderCount) * 100 : 0;
+
+  const csv = asCsv([
+    ["Report", "Executive Weekly Digest"],
+    ["Window", `Last ${days} days`],
+    ["Generated At", new Date().toISOString()],
+    [],
+    ["Orders", String(orderCount)],
+    ["Gross Revenue", gross.toFixed(2)],
+    ["Net Cash", net.toFixed(2)],
+    ["Ad Spend", spend.toFixed(2)],
+    ["Blended ROAS", blendedRoas.toFixed(2)],
+    ["Margin %", marginPct.toFixed(1)],
+    ["Discount %", discountPct.toFixed(1)],
+    ["Refund %", refundPct.toFixed(1)],
+    ["RTO %", rtoPct.toFixed(1)],
+    ["Attribution Gap %", attributionGapPct.toFixed(1)],
+    ["Creative Fatigue Count", Array.isArray(creativeFatigue) ? creativeFatigue.length : 0],
+  ]);
+
+  const pdfLines = [
+    `Window: Last ${days} days`,
+    `Orders: ${orderCount}`,
+    `Net Cash: ${net.toFixed(2)} | Ad Spend: ${spend.toFixed(2)} | Blended ROAS: ${blendedRoas.toFixed(2)}x`,
+    `Margin: ${marginPct.toFixed(1)}% | Discount: ${discountPct.toFixed(1)}% | Refund: ${refundPct.toFixed(1)}% | RTO: ${rtoPct.toFixed(1)}%`,
+    `Attribution Gap: ${attributionGapPct.toFixed(1)}% | Creative Fatigue: ${Array.isArray(creativeFatigue) ? creativeFatigue.length : 0}`,
+  ];
+  return { title: `Netcash Executive Digest (${days}d)`, csv, pdfLines };
+}
+
 async function buildReportData(schedule) {
   const filters = parseJson(schedule.filters, {});
   const page = safePage(schedule.page);
   if (page === "campaigns") return buildCampaignReport(schedule.shop, filters);
   if (page === "alerts") return buildAlertsReport(schedule.shop, filters);
+  if (page === "growth") return buildGrowthReport(schedule.shop, filters);
   return buildHomeReport(schedule.shop, filters);
 }
 
@@ -447,6 +587,34 @@ async function sendViaResend({ to, subject, text, attachments }) {
     const body = await response.text();
     throw new Error(`Resend API failed (${response.status}): ${body}`);
   }
+}
+
+export async function sendGrowthDigestNow({ shop, email, days = 7, format = "both", name = "Executive Digest" }) {
+  const report = await buildGrowthReport(shop, { days });
+  const attachments = [];
+  const safeFormatValue = safeFormat(format);
+  const stamp = new Date().toISOString().replaceAll(":", "-");
+
+  if (safeFormatValue === "csv" || safeFormatValue === "both") {
+    attachments.push({
+      filename: `growth_${stamp}.csv`,
+      content: Buffer.from(report.csv, "utf8").toString("base64"),
+    });
+  }
+  if (safeFormatValue === "pdf" || safeFormatValue === "both") {
+    attachments.push({
+      filename: `growth_${stamp}.pdf`,
+      content: buildPdfBuffer(report.title, report.pdfLines).toString("base64"),
+    });
+  }
+
+  await sendViaResend({
+    to: email,
+    subject: `${name} • Netcash.ai`,
+    text: `${report.title}\n\nGenerated at: ${new Date().toISOString()}\nShop: ${shop}`,
+    attachments,
+  });
+  return { ok: true, attachmentCount: attachments.length };
 }
 
 export async function runDueScheduledReports(maxRuns = 50) {

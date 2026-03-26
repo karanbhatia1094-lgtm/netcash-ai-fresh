@@ -11,6 +11,8 @@
     "build:prod": "npm run prisma:generate:prod && remix build",
     "start": "remix-serve build/index.js",
     "start:prod": "remix-serve build/index.js",
+    "config:staging": "shopify app config use shopify.app.staging.toml",
+    "deploy:staging": "shopify app deploy --config shopify.app.staging.toml",
     "worker:once": "node scripts/run-worker-once.mjs",
     "worker:loop": "node scripts/run-worker-loop.mjs",
     "autopilot:enqueue": "node scripts/trigger-autopilot-cron.mjs",

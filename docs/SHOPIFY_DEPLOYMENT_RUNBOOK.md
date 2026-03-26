@@ -23,6 +23,28 @@
   - `application_url`
   - `auth.redirect_urls`
 
+## Staging (non-production) deployment
+Use this when you want a public URL for testing without running production mode.
+
+1. Configure Shopify CLI staging TOML:
+- Use `shopify.app.staging.toml`
+- Set:
+  - `client_id`
+  - `application_url`
+  - `auth.redirect_urls`
+
+2. Host env vars (staging):
+- `NODE_ENV=development`
+- `SHOPIFY_APP_URL` (same as staging domain)
+- `APP_BASE_URL` (same as staging domain)
+- `DATABASE_PROVIDER=postgresql`
+- `DATABASE_URL` (Postgres only)
+- `JOB_WORKER_KEY`
+- `CONNECTOR_CRON_KEY`
+- `AUTOPILOT_CRON_KEY` (recommended)
+- `ROLLOUT_CANARY_ONLY=true`
+- `ROLLOUT_CANARY_SHOPS=your-dev-store.myshopify.com`
+
 ## 2) Database and build
 1. `npm run prisma:generate:prod`
 2. `npm run prisma:migrate:prod`

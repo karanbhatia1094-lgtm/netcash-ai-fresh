@@ -1,4 +1,5 @@
 import { upsertToolAttribution } from "../utils/db.server";
+import { enforceRateLimit } from "../utils/rate-limit.server";
 import { extractAttributionRecords, SUPPORTED_PROVIDERS } from "../utils/connectors";
 
 function json(data, init = {}) {
@@ -16,6 +17,8 @@ export async function action({ request }) {
     if (request.method !== "POST") {
       return json({ error: "Method not allowed" }, { status: 405 });
     }
+    const rateLimited = enforceRateLimit(request, { key: "api:attribution", limit: 300, windowMs: 60_000 });
+    if (rateLimited) return rateLimited;
 
     const expectedKey = process.env.ATTRIBUTION_API_KEY;
     if (expectedKey) {

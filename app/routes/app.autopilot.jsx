@@ -7,6 +7,7 @@ import {
   listProfitGuardrailRuns,
   runProfitGuardrails,
 } from "../utils/profit-guardrails.server";
+import { resolveShopConfig, upsertShopSetting } from "../utils/release-control.server";
 
 function isTrue(value) {
   return ["1", "true", "yes", "on"].includes(String(value || "").toLowerCase());
@@ -16,6 +17,11 @@ function pct(value) {
   return `${Number(value || 0).toFixed(1)}%`;
 }
 
+function parseNumber(value, fallback) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
 export async function loader({ request }) {
   const { session } = await authenticate.admin(request);
   const url = new URL(request.url);
@@ -23,11 +29,26 @@ export async function loader({ request }) {
   const runs = await listProfitGuardrailRuns(session.shop, 12);
   const runId = selectedRunId || runs[0]?.id || "";
   const decisions = runId ? await listProfitGuardrailDecisions(runId, 200) : [];
+  const shopConfig = await resolveShopConfig(session.shop, {
+    growth_guardrail_max_cac: "0",
+    growth_guardrail_min_margin_pct: "15",
+    growth_guardrail_max_rto_pct: "12",
+    growth_guardrail_max_discount_pct: "30",
+    growth_guardrail_max_refund_pct: "6",
+  });
+  const guardrails = {
+    maxCac: parseNumber(shopConfig.growth_guardrail_max_cac, 0),
+    minMarginPct: parseNumber(shopConfig.growth_guardrail_min_margin_pct, 12),
+    maxRtoPct: parseNumber(shopConfig.growth_guardrail_max_rto_pct, 15),
+    maxDiscountPct: parseNumber(shopConfig.growth_guardrail_max_discount_pct, 25),
+    maxRefundPct: parseNumber(shopConfig.growth_guardrail_max_refund_pct, 8),
+  };
   return {
     shop: session.shop,
     runs,
     selectedRunId: runId || null,
     decisions,
+    guardrails,
   };
 }
 
@@ -35,6 +56,24 @@ export async function action({ request }) {
   const { session } = await authenticate.admin(request);
   const formData = await request.formData();
   const intent = String(formData.get("intent") || "run");
+
+  if (intent === "save-guardrails") {
+    const updates = [
+      ["growth_guardrail_max_cac", formData.get("max_cac")],
+      ["growth_guardrail_min_margin_pct", formData.get("min_margin_pct")],
+      ["growth_guardrail_max_rto_pct", formData.get("max_rto_pct")],
+      ["growth_guardrail_max_discount_pct", formData.get("max_discount_pct")],
+      ["growth_guardrail_max_refund_pct", formData.get("max_refund_pct")],
+    ];
+    for (const [key, value] of updates) {
+      // eslint-disable-next-line no-await-in-loop
+      await upsertShopSetting(session.shop, key, String(value ?? ""));
+    }
+    const runs = await listProfitGuardrailRuns(session.shop, 12);
+    const runId = runs[0]?.id || "";
+    const decisions = runId ? await listProfitGuardrailDecisions(runId, 200) : [];
+    return { ok: true, message: "Guardrails saved.", runs, selectedRunId: runId || null, decisions };
+  }
 
   if (intent === "create-rollback") {
     const decisionId = String(formData.get("decisionId") || "").trim();
@@ -86,6 +125,7 @@ export default function AutopilotPage() {
   const loaderData = useLoaderData();
   const actionData = useActionData();
   const data = actionData?.ok ? actionData : loaderData;
+  const guardrails = loaderData?.guardrails || {};
   const latestSummary = data?.runs?.[0]?.summary || {};
   const quality = latestSummary?.quality || {};
   const sourceImpact = Array.isArray(latestSummary?.sourceImpact) ? latestSummary.sourceImpact : [];
@@ -96,6 +136,39 @@ export default function AutopilotPage() {
       <p className="nc-subtitle">
         Confidence-scored throttle/scale recommendations for {data.shop}. Start with dry run, then apply on high-confidence windows.
       </p>
+
+      <div className="nc-card nc-section nc-glass">
+        <div className="nc-section-head-inline">
+          <h2>Guardrail Control Panel</h2>
+          <span className="nc-note">These thresholds power risk alerts and autopilot rules.</span>
+        </div>
+        <Form method="post" className="nc-grid-3" preventScrollReset>
+          <input type="hidden" name="intent" value="save-guardrails" />
+          <label className="nc-form-field nc-inline-field">
+            <span>Max CAC (INR)</span>
+            <input name="max_cac" defaultValue={guardrails.maxCac} />
+          </label>
+          <label className="nc-form-field nc-inline-field">
+            <span>Min Margin %</span>
+            <input name="min_margin_pct" defaultValue={guardrails.minMarginPct} />
+          </label>
+          <label className="nc-form-field nc-inline-field">
+            <span>Max RTO %</span>
+            <input name="max_rto_pct" defaultValue={guardrails.maxRtoPct} />
+          </label>
+          <label className="nc-form-field nc-inline-field">
+            <span>Max Discount %</span>
+            <input name="max_discount_pct" defaultValue={guardrails.maxDiscountPct} />
+          </label>
+          <label className="nc-form-field nc-inline-field">
+            <span>Max Refund %</span>
+            <input name="max_refund_pct" defaultValue={guardrails.maxRefundPct} />
+          </label>
+          <div className="nc-toolbar" style={{ marginBottom: 0 }}>
+            <button type="submit" className="nc-chip">Save Guardrails</button>
+          </div>
+        </Form>
+      </div>
 
       <div className="nc-grid-3">
         <div className="nc-kpi-card">

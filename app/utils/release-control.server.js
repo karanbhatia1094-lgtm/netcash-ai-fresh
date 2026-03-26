@@ -45,6 +45,12 @@ const ALLOWED_SHOP_SETTING_KEYS = Object.freeze([
   "feature_pack",
   "connector_actions_enabled",
   "channel_actions_enabled_csv",
+  "growth_guardrail_max_cac",
+  "growth_guardrail_min_margin_pct",
+  "growth_guardrail_max_rto_pct",
+  "growth_guardrail_max_discount_pct",
+  "growth_guardrail_max_refund_pct",
+  "growth_experiment_log",
 ]);
 
 export function getAllowedShopSettingKeys() {
