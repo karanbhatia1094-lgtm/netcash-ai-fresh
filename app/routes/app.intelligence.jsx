@@ -1,5 +1,4 @@
-import { Link, useLoaderData, useRouteError, isRouteErrorResponse, useLocation, useNavigate } from "@remix-run/react";
-import { useEffect, useState } from "react";
+import { Link, useLoaderData, useRouteError, isRouteErrorResponse } from "@remix-run/react";
 import { authenticate } from "../shopify.server";
 import { getOrders, getSourceMetrics, listConnectorCredentials } from "../utils/db.server";
 
@@ -217,15 +216,6 @@ function buildRecommendations(utm, behavior, connectorsCount, spend30) {
 export async function loader({ request }) {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
-  const url = new URL(request.url);
-  const rawSourcesParam = String(url.searchParams.get("sources") || "all");
-  const selectedSources = rawSourcesParam
-    .split(",")
-    .map((row) => row.trim().toLowerCase())
-    .filter(Boolean);
-  const normalizedSelectedSources = selectedSources.length ? [...new Set(selectedSources)] : ["all"];
-  const includeAllSources = normalizedSelectedSources.includes("all");
-  const sourceFilterSet = new Set(normalizedSelectedSources.filter((row) => row !== "all"));
   const [orders90, orders365, spend30, connectors] = await Promise.all([
     getOrders(shop, 90),
     getOrders(shop, 365),
@@ -233,13 +223,9 @@ export async function loader({ request }) {
     listConnectorCredentials(shop),
   ]);
 
-  const sourceOfOrder = (order) => String(order?.marketingSource || order?.utmSource || "unknown").toLowerCase();
-  const orders90Filtered = includeAllSources ? orders90 : (orders90 || []).filter((o) => sourceFilterSet.has(sourceOfOrder(o)));
-  const orders365Filtered = includeAllSources ? orders365 : (orders365 || []).filter((o) => sourceFilterSet.has(sourceOfOrder(o)));
-  const spend30Filtered = includeAllSources ? spend30 : (spend30 || []).filter((row) => sourceFilterSet.has(String(row.source || "").toLowerCase()));
-  const utm = buildUtmAndSourceQuality(orders90Filtered);
-  const behavior = buildBehaviorInsights(orders365Filtered);
-  const spend30Total = (spend30Filtered || []).reduce((sum, row) => sum + Number(row.adSpend || 0), 0);
+  const utm = buildUtmAndSourceQuality(orders90);
+  const behavior = buildBehaviorInsights(orders365);
+  const spend30Total = (spend30 || []).reduce((sum, row) => sum + Number(row.adSpend || 0), 0);
   const paidConnectors = (connectors || []).filter((row) => ["meta_ads", "google_ads"].includes(row.provider) && row.accessToken).length;
   const recommendations = buildRecommendations(utm, behavior, paidConnectors, spend30Total);
 
@@ -250,123 +236,16 @@ export async function loader({ request }) {
     spend30Total,
     paidConnectors,
     recommendations,
-    selectedSources: normalizedSelectedSources,
-    availableSources: [...new Set([
-      ...(orders90 || []).map((row) => sourceOfOrder(row)),
-      ...(spend30 || []).map((row) => String(row.source || "").toLowerCase()),
-    ])].filter(Boolean).sort(),
   };
 }
 
 export default function IntelligenceStudioPage() {
-  const { shop, utm, behavior, paidConnectors, recommendations, spend30Total, selectedSources: selectedSourcesFromLoader, availableSources } = useLoaderData();
-  const [sourceSearch, setSourceSearch] = useState("");
-  const [multiSourceOpen, setMultiSourceOpen] = useState(false);
-  const [selectedSources, setSelectedSources] = useState(selectedSourcesFromLoader || ["all"]);
-  const sourceOptions = [...new Set((availableSources || []).map((row) => String(row || "").toLowerCase()).filter(Boolean))].sort();
-  const location = useLocation();
-  const navigate = useNavigate();
-  const isAllSources = selectedSources.includes("all");
-  const updateSourcesInUrl = (nextSources) => {
-    const params = new URLSearchParams(location.search);
-    params.set("sources", (nextSources || ["all"]).join(","));
-    navigate(`?${params.toString()}`, { preventScrollReset: true });
-  };
-  const toggleSource = (item) => {
-    const normalized = String(item || "").trim().toLowerCase();
-    if (!normalized) return;
-    if (normalized === "all") {
-      setSelectedSources(["all"]);
-      updateSourcesInUrl(["all"]);
-      return;
-    }
-    const current = isAllSources ? [] : [...selectedSources];
-    const exists = current.includes(normalized);
-    const next = exists ? current.filter((row) => row !== normalized) : [...current, normalized];
-    const finalNext = next.length ? next : ["all"];
-    setSelectedSources(finalNext);
-    updateSourcesInUrl(finalNext);
-  };
-  const filteredSourceOptions = sourceOptions.filter((item) =>
-    item.includes(String(sourceSearch || "").toLowerCase()));
-  const singleSourceValue =
-    isAllSources ? "all" : selectedSources.length === 1 ? selectedSources[0] : "custom";
-  const displayTopSourceCampaigns = isAllSources
-    ? (utm.topSourceCampaigns || [])
-    : (utm.topSourceCampaigns || []).filter((row) => selectedSources.includes(String(row?.source || "").toLowerCase()));
-  const displayQualityRows = isAllSources
-    ? (utm.qualityRows || [])
-    : (utm.qualityRows || []).filter((row) => selectedSources.includes(String(row?.source || "").toLowerCase()));
-
-  useEffect(() => {
-    setSelectedSources(selectedSourcesFromLoader || ["all"]);
-  }, [selectedSourcesFromLoader]);
+  const { shop, utm, behavior, paidConnectors, recommendations, spend30Total } = useLoaderData();
 
   return (
-    <div className="nc-shell nc-intelligence">
+    <div className="nc-shell">
       <h1>Intelligence Studio</h1>
       <p className="nc-subtitle">UTM quality, behavior timing, repeat windows, and action-ready recommendations for {shop}.</p>
-
-      <div className="nc-card nc-section nc-glass">
-        <h2>Source Filter</h2>
-        <div className="nc-toolbar nc-filter-bar">
-          <label className="nc-form-field nc-inline-field">
-            <span>Source</span>
-            <select
-              value={singleSourceValue}
-              onChange={(event) => {
-                const next = String(event.target.value || "all");
-                if (next === "custom") return;
-                toggleSource(next);
-              }}
-            >
-              <option value="all">All sources</option>
-              {sourceOptions.map((item) => (
-                <option key={`intel-src-${item}`} value={item}>
-                  {String(item || "").replace(/_/g, " ")}
-                </option>
-              ))}
-              {singleSourceValue === "custom" ? <option value="custom">Multiple selected</option> : null}
-            </select>
-          </label>
-          <button
-            type="button"
-            className={`nc-chip ${multiSourceOpen ? "is-active" : ""}`}
-            onClick={() => setMultiSourceOpen((current) => !current)}
-          >
-            {multiSourceOpen ? "Hide multi-select" : "Multi-select"}
-          </button>
-        </div>
-        {multiSourceOpen ? (
-          <div className="nc-source-picker-panel" style={{ marginTop: "8px" }}>
-            <input
-              type="search"
-              value={sourceSearch}
-              onChange={(event) => setSourceSearch(event.target.value)}
-              placeholder="Search source"
-              aria-label="Search sources"
-            />
-            <label className="nc-inline-field">
-              <input
-                type="checkbox"
-                checked={isAllSources}
-                onChange={() => toggleSource("all")}
-              />
-              <span>All</span>
-            </label>
-            {filteredSourceOptions.map((item) => (
-              <label key={`intel-src-multi-${item}`} className="nc-inline-field">
-                <input
-                  type="checkbox"
-                  checked={selectedSources.includes(item) && !isAllSources}
-                  onChange={() => toggleSource(item)}
-                />
-                <span style={{ textTransform: "capitalize" }}>{item}</span>
-              </label>
-            ))}
-          </div>
-        ) : null}
-      </div>
 
       <div className="nc-card nc-section nc-glass">
         <h2>Attribution Quality</h2>
@@ -389,7 +268,7 @@ export default function IntelligenceStudioPage() {
         <table className="nc-table-card">
           <thead><tr><th style={{ textAlign: "left" }}>UTM Source</th><th style={{ textAlign: "left" }}>UTM Campaign</th><th style={{ textAlign: "right" }}>Orders</th></tr></thead>
           <tbody>
-            {displayTopSourceCampaigns.length === 0 ? (
+            {(utm.topSourceCampaigns || []).length === 0 ? (
               <tr>
                 <td colSpan={3}>
                   <div className="nc-empty-block">
@@ -398,7 +277,7 @@ export default function IntelligenceStudioPage() {
                 </td>
               </tr>
             ) : (
-              displayTopSourceCampaigns.map((row, idx) => (
+              utm.topSourceCampaigns.map((row, idx) => (
                 <tr key={`utm-top-${idx}-${row.source}-${row.campaign}`}>
                   <td data-label="UTM Source" style={{ textTransform: "capitalize" }}>{row.source}</td>
                   <td data-label="UTM Campaign">{row.campaign}</td>
@@ -415,7 +294,7 @@ export default function IntelligenceStudioPage() {
         <table className="nc-table-card">
           <thead><tr><th style={{ textAlign: "left" }}>Source</th><th style={{ textAlign: "right" }}>Orders</th><th style={{ textAlign: "right" }}>Any UTM</th><th style={{ textAlign: "right" }}>Full UTM</th><th style={{ textAlign: "right" }}>Click ID</th><th style={{ textAlign: "right" }}>Net Cash</th></tr></thead>
           <tbody>
-            {displayQualityRows.length === 0 ? (
+            {(utm.qualityRows || []).length === 0 ? (
               <tr>
                 <td colSpan={6}>
                   <div className="nc-empty-block">
@@ -424,7 +303,7 @@ export default function IntelligenceStudioPage() {
                 </td>
               </tr>
             ) : (
-              displayQualityRows.map((row) => (
+              utm.qualityRows.map((row) => (
                 <tr key={`src-q-${row.source}`}>
                   <td data-label="Source" style={{ textTransform: "capitalize" }}>{row.source}</td>
                   <td data-label="Orders" style={{ textAlign: "right" }}>{row.orders}</td>
@@ -482,7 +361,7 @@ export function ErrorBoundary() {
     ? `${error.status} ${error.statusText}`
     : String(error?.message || "Something went wrong while loading Intelligence Studio.");
   return (
-    <div className="nc-shell nc-intelligence">
+    <div className="nc-shell">
       <div className="nc-card nc-section">
         <h2>Intelligence Studio unavailable</h2>
         <p className="nc-note">{message}</p>

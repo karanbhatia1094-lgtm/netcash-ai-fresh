@@ -1,6 +1,5 @@
 import { authenticate } from "../shopify.server";
 import { recordFeatureUsageEvent } from "../utils/feature-usage.server";
-import { enforceRateLimit } from "../utils/rate-limit.server";
 
 function json(data, init = {}) {
   return new Response(JSON.stringify(data), {
@@ -14,8 +13,6 @@ function json(data, init = {}) {
 
 export async function action({ request }) {
   try {
-    const rateLimited = enforceRateLimit(request, { key: "api:usage_event", limit: 600, windowMs: 60_000 });
-    if (rateLimited) return rateLimited;
     const { session } = await authenticate.admin(request);
     const body = await request.json().catch(() => ({}));
     const event = body?.event || {};

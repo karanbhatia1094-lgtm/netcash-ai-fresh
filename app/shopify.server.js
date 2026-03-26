@@ -95,10 +95,6 @@ const shopify = shopifyApp({
       deliveryMethod: DeliveryMethod.Http,
       callbackUrl: "/webhooks/app/scopes_update",
     },
-    APP_SUBSCRIPTIONS_UPDATE: {
-      deliveryMethod: DeliveryMethod.Http,
-      callbackUrl: "/webhooks/app/subscriptions_update",
-    },
     ORDERS_CREATE: {
       deliveryMethod: DeliveryMethod.Http,
       callbackUrl: "/webhooks/app/orders_create",

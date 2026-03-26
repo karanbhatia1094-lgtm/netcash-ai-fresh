@@ -1,6 +1,5 @@
 import crypto from "node:crypto";
 import { prisma } from "../../prisma.client.js";
-import { resolveShopConfig } from "./release-control.server";
 
 function normalizeMarketingSource(rawValue) {
   const source = String(rawValue || "").trim().toLowerCase();
@@ -1028,7 +1027,7 @@ export async function getUniversalShopOverview(shop, days = 90) {
   }
 }
 
-export async function getUniversalInsights(shop, days = 90, sources = null) {
+export async function getUniversalInsights(shop, days = 90) {
   const defaultPayload = {
     days,
     totals: {
@@ -1087,16 +1086,15 @@ export async function getUniversalInsights(shop, days = 90, sources = null) {
   if (!prisma.universalSignalEvent) return defaultPayload;
 
   const since = sinceDateForDays(days);
-  const sourceFilter = Array.isArray(sources) && sources.length ? { source: { in: sources } } : {};
   try {
     const [events, groupedIdentities] = await Promise.all([
       prisma.universalSignalEvent.findMany({
-        where: { shop, eventAt: { gte: since }, ...sourceFilter },
+        where: { shop, eventAt: { gte: since } },
         orderBy: { eventAt: "asc" },
       }),
       prisma.universalSignalEvent.groupBy({
         by: ["identityKey"],
-        where: { shop, eventAt: { gte: since }, identityKey: { not: null }, ...sourceFilter },
+        where: { shop, eventAt: { gte: since }, identityKey: { not: null } },
       }),
     ]);
 
@@ -1509,207 +1507,6 @@ export async function deleteSpendEntry(entryId) {
   return prisma.marketingSpendEntry.delete({
     where: { id },
   });
-}
-
-export async function listUniversalSources(shop, days = 90) {
-  if (!prisma.universalSignalEvent) return [];
-  const since = sinceDateForDays(days);
-  try {
-    const rows = await prisma.universalSignalEvent.findMany({
-      where: { shop, eventAt: { gte: since }, source: { not: null } },
-      distinct: ["source"],
-      select: { source: true },
-    });
-    return rows
-      .map((row) => String(row?.source || "").toLowerCase())
-      .filter(Boolean)
-      .sort();
-  } catch (error) {
-    if (isSchemaMismatchError(error)) return [];
-    throw error;
-  }
-}
-
-const CREATIVE_FATIGUE_DEFAULTS = {
-  minImpressions: Number(process.env.CREATIVE_FATIGUE_MIN_IMPRESSIONS || 5000),
-  minSpend: Number(process.env.CREATIVE_FATIGUE_MIN_SPEND || 500),
-  ctrDropPct: Number(process.env.CREATIVE_FATIGUE_CTR_DROP_PCT || 30),
-  minAgeDays: Number(process.env.CREATIVE_FATIGUE_MIN_AGE_DAYS || 7),
-  frequency: Number(process.env.CREATIVE_FATIGUE_FREQUENCY || 2.5),
-};
-
-function normalizeSourceFilters(source) {
-  const raw = Array.isArray(source)
-    ? source
-    : String(source || "all")
-      .split(",")
-      .map((row) => row.trim())
-      .filter(Boolean);
-  const normalized = [...new Set(raw.map((row) => String(row).toLowerCase()))];
-  const includeAll = normalized.length === 0 || normalized.includes("all");
-  const filterSet = new Set(normalized.filter((row) => row !== "all"));
-  return { includeAll, filterSet };
-}
-
-export async function upsertCreativeMetricDaily(shop, row = {}) {
-  if (!prisma.creativeMetricDaily) return null;
-  try {
-    const reportDate = startOfDay(row.reportDate || new Date());
-    return await prisma.creativeMetricDaily.upsert({
-      where: {
-        shop_source_adId_reportDate: {
-          shop: String(shop),
-          source: String(row.source || "unknown").toLowerCase(),
-          adId: String(row.adId || ""),
-          reportDate,
-        },
-      },
-      update: {
-        adName: row.adName || null,
-        adSetId: row.adSetId || null,
-        adSetName: row.adSetName || null,
-        campaignId: row.campaignId || null,
-        campaignName: row.campaignName || null,
-        impressions: Number(row.impressions || 0),
-        clicks: Number(row.clicks || 0),
-        spend: Number(row.spend || 0),
-        ctr: Number(row.ctr || 0),
-        frequency: row.frequency == null ? null : Number(row.frequency || 0),
-        conversions: Number(row.conversions || 0),
-      },
-      create: {
-        shop: String(shop),
-        source: String(row.source || "unknown").toLowerCase(),
-        adId: String(row.adId || ""),
-        adName: row.adName || null,
-        adSetId: row.adSetId || null,
-        adSetName: row.adSetName || null,
-        campaignId: row.campaignId || null,
-        campaignName: row.campaignName || null,
-        reportDate,
-        impressions: Number(row.impressions || 0),
-        clicks: Number(row.clicks || 0),
-        spend: Number(row.spend || 0),
-        ctr: Number(row.ctr || 0),
-        frequency: row.frequency == null ? null : Number(row.frequency || 0),
-        conversions: Number(row.conversions || 0),
-      },
-    });
-  } catch (error) {
-    if (isSchemaMismatchError(error)) return null;
-    throw error;
-  }
-}
-
-export async function upsertCreativeMetricBatch(shop, rows = []) {
-  if (!prisma.creativeMetricDaily) return 0;
-  let written = 0;
-  for (const row of rows || []) {
-    if (!row?.adId) continue;
-    // eslint-disable-next-line no-await-in-loop
-    await upsertCreativeMetricDaily(shop, row);
-    written += 1;
-  }
-  return written;
-}
-
-function aggregateCreativeWindow(rows, { start, end }) {
-  const summary = {
-    impressions: 0,
-    clicks: 0,
-    spend: 0,
-    frequencyTotal: 0,
-    frequencyCount: 0,
-  };
-  for (const row of rows) {
-    const date = new Date(row.reportDate);
-    if (date < start || date > end) continue;
-    summary.impressions += Number(row.impressions || 0);
-    summary.clicks += Number(row.clicks || 0);
-    summary.spend += Number(row.spend || 0);
-    if (row.frequency != null) {
-      summary.frequencyTotal += Number(row.frequency || 0);
-      summary.frequencyCount += 1;
-    }
-  }
-  summary.ctr = summary.impressions > 0 ? summary.clicks / summary.impressions : 0;
-  summary.frequencyAvg = summary.frequencyCount > 0 ? summary.frequencyTotal / summary.frequencyCount : null;
-  return summary;
-}
-
-export async function getCreativeFatigueRisks(shop, days = 30, source = "all") {
-  if (!prisma.creativeMetricDaily) return [];
-  const lookback = Math.max(14, Number(days) || 30);
-  const sinceDate = sinceDateForDays(lookback);
-  const { includeAll, filterSet } = normalizeSourceFilters(source);
-  try {
-    const rows = await prisma.creativeMetricDaily.findMany({
-      where: {
-        shop: String(shop),
-        reportDate: { gte: sinceDate },
-        ...(includeAll ? {} : { source: { in: [...filterSet] } }),
-      },
-      orderBy: [{ source: "asc" }, { adId: "asc" }, { reportDate: "asc" }],
-    });
-
-    const grouped = new Map();
-    for (const row of rows) {
-      const key = `${row.source}|${row.adId}`;
-      if (!grouped.has(key)) grouped.set(key, []);
-      grouped.get(key).push(row);
-    }
-
-    const recentWindow = dayWindow(7, 0);
-    const prevWindow = dayWindow(14, 7);
-    const risks = [];
-    for (const [key, entries] of grouped.entries()) {
-      const [sourceKey, adId] = key.split("|");
-      const firstSeen = entries.reduce((min, row) => (row.reportDate < min ? row.reportDate : min), entries[0].reportDate);
-      const ageDays = Math.floor((Date.now() - new Date(firstSeen).getTime()) / (1000 * 60 * 60 * 24));
-      const recent = aggregateCreativeWindow(entries, recentWindow);
-      const previous = aggregateCreativeWindow(entries, prevWindow);
-      if (recent.impressions < CREATIVE_FATIGUE_DEFAULTS.minImpressions) continue;
-      if (recent.spend < CREATIVE_FATIGUE_DEFAULTS.minSpend) continue;
-      if (previous.impressions <= 0 || previous.ctr <= 0) continue;
-      const ctrDeltaPct = pctChange(recent.ctr, previous.ctr);
-      if (ctrDeltaPct > -CREATIVE_FATIGUE_DEFAULTS.ctrDropPct) continue;
-      const freq = recent.frequencyAvg;
-      if (ageDays < CREATIVE_FATIGUE_DEFAULTS.minAgeDays && (!freq || freq < CREATIVE_FATIGUE_DEFAULTS.frequency)) continue;
-
-      const isCritical = ctrDeltaPct <= -50 || (freq != null && freq >= 3.5) || ageDays >= 21;
-      const representative = entries[entries.length - 1];
-      risks.push({
-        source: sourceKey,
-        adId,
-        adName: representative?.adName || null,
-        adSetName: representative?.adSetName || null,
-        campaignId: representative?.campaignId || null,
-        campaignName: representative?.campaignName || null,
-        recentCtr: recent.ctr,
-        prevCtr: previous.ctr,
-        ctrDeltaPct,
-        recentSpend: recent.spend,
-        recentImpressions: recent.impressions,
-        recentClicks: recent.clicks,
-        frequencyAvg: freq,
-        ageDays,
-        severity: isCritical ? "critical" : "warning",
-        recommendation: isCritical
-          ? "Refresh creative and cap frequency."
-          : "Test new hook variations within 48h.",
-      });
-    }
-
-    return risks
-      .sort((a, b) => {
-        if (a.severity !== b.severity) return a.severity === "critical" ? -1 : 1;
-        return a.ctrDeltaPct - b.ctrDeltaPct;
-      })
-      .slice(0, 40);
-  } catch (error) {
-    if (isSchemaMismatchError(error)) return [];
-    throw error;
-  }
 }
 
 export async function getConnectorCredential(shop, provider) {
@@ -2253,14 +2050,6 @@ const ALERT_RULES = {
   roas_drop: "ROAS Drop",
   spend_spike: "Spend Spike",
   order_drop: "Order Volume Drop",
-  attribution_overlap: "Attribution Overlap Risk",
-  landing_mismatch: "Landing Page Mismatch",
-  creative_fatigue: "Creative Fatigue Risk",
-  guardrail_margin: "Guardrail: Margin Breach",
-  guardrail_rto: "Guardrail: RTO Breach",
-  guardrail_discount: "Guardrail: Discount Breach",
-  guardrail_refund: "Guardrail: Refund Breach",
-  guardrail_cac: "Guardrail: CAC Breach",
 };
 
 export function listAlertRules() {
@@ -2320,11 +2109,6 @@ function pctChange(current, previous) {
   return ((current - previous) / previous) * 100;
 }
 
-function parseNumber(value, fallback) {
-  const num = Number(value);
-  return Number.isFinite(num) ? num : fallback;
-}
-
 function dayWindow(daysBackStart, daysBackEnd = 0) {
   const start = new Date();
   start.setDate(start.getDate() - daysBackStart);
@@ -2333,42 +2117,6 @@ function dayWindow(daysBackStart, daysBackEnd = 0) {
   end.setDate(end.getDate() - daysBackEnd);
   end.setHours(23, 59, 59, 999);
   return { start, end };
-}
-
-function safeTouchpoints(value) {
-  if (!value) return [];
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function landingPathType(value) {
-  if (!value) return "unknown";
-  try {
-    const path = new URL(value, "https://example.com").pathname || "";
-    const normalized = path.toLowerCase();
-    if (!normalized || normalized === "/") return "home";
-    if (normalized.startsWith("/products/")) return "product";
-    if (normalized.startsWith("/collections/")) return "collection";
-    if (normalized.startsWith("/pages/")) return "page";
-    return "other";
-  } catch {
-    return "unknown";
-  }
-}
-
-function touchpointSources(order) {
-  const sources = new Set();
-  const base = String(order?.marketingSource || "").toLowerCase();
-  if (base) sources.add(base);
-  for (const touch of safeTouchpoints(order?.touchpointsJson)) {
-    const source = String(touch?.source || touch?.tool || "").toLowerCase();
-    if (source) sources.add(source);
-  }
-  return sources;
 }
 
 async function upsertAlertEvent(shop, candidate) {
@@ -2422,20 +2170,6 @@ export async function evaluateAndStoreAlerts(shop) {
   if (!prisma.alertEvent || !prisma.alertRuleSetting) return { created: 0 };
   const settings = await listAlertRuleSettings(shop);
   const settingsMap = new Map(settings.map((s) => [s.ruleKey, s]));
-  const guardrailConfig = await resolveShopConfig(shop, {
-    growth_guardrail_max_cac: "0",
-    growth_guardrail_min_margin_pct: "12",
-    growth_guardrail_max_rto_pct: "15",
-    growth_guardrail_max_discount_pct: "25",
-    growth_guardrail_max_refund_pct: "8",
-  });
-  const guardrails = {
-    maxCac: parseNumber(guardrailConfig.growth_guardrail_max_cac, 0),
-    minMarginPct: parseNumber(guardrailConfig.growth_guardrail_min_margin_pct, 12),
-    maxRtoPct: parseNumber(guardrailConfig.growth_guardrail_max_rto_pct, 15),
-    maxDiscountPct: parseNumber(guardrailConfig.growth_guardrail_max_discount_pct, 25),
-    maxRefundPct: parseNumber(guardrailConfig.growth_guardrail_max_refund_pct, 8),
-  };
 
   const rCurrent = dayWindow(3, 0);
   const rPrev = dayWindow(6, 3);
@@ -2463,19 +2197,10 @@ export async function evaluateAndStoreAlerts(shop) {
   const prevNet = prevOrders.reduce((s, o) => s + (o.netCash || 0), 0);
   const currentGross = currentOrders.reduce((s, o) => s + (o.grossValue || 0), 0);
   const prevGross = prevOrders.reduce((s, o) => s + (o.grossValue || 0), 0);
-  const currentDiscount = currentOrders.reduce((s, o) => s + (o.discountTotal || 0), 0);
-  const currentRefund = currentOrders.reduce((s, o) => s + (o.refundTotal || 0), 0);
-  const currentRtoCount = currentOrders.filter((o) => o.isRTO).length;
   const currentSpend = currentSpendRows.reduce((s, r) => s + (r.adSpend || 0), 0);
   const prevSpend = prevSpendRows.reduce((s, r) => s + (r.adSpend || 0), 0);
   const currentRoas = currentSpend > 0 ? currentNet / currentSpend : 0;
   const prevRoas = prevSpend > 0 ? prevNet / prevSpend : 0;
-  const currentOrdersCount = currentOrders.length;
-  const currentMarginPct = currentGross > 0 ? (currentNet / currentGross) * 100 : 0;
-  const currentDiscountPct = currentGross > 0 ? (currentDiscount / currentGross) * 100 : 0;
-  const currentRefundPct = currentGross > 0 ? (currentRefund / currentGross) * 100 : 0;
-  const currentRtoPct = currentOrdersCount > 0 ? (currentRtoCount / currentOrdersCount) * 100 : 0;
-  const currentCac = currentOrdersCount > 0 ? currentSpend / currentOrdersCount : 0;
 
   const candidates = [];
   const netDelta = pctChange(currentNet, prevNet);
@@ -2520,125 +2245,6 @@ export async function evaluateAndStoreAlerts(shop) {
       message: `Order count changed ${orderDelta.toFixed(1)}% in last 3 days vs prior 3 days.`,
       fingerprintKey: `order_drop:${new Date().toISOString().slice(0, 10)}`,
     });
-  }
-
-  if (guardrails.minMarginPct > 0 && currentMarginPct < guardrails.minMarginPct) {
-    candidates.push({
-      ruleKey: "guardrail_margin",
-      severity: currentMarginPct < guardrails.minMarginPct * 0.7 ? "critical" : "warning",
-      title: "Margin guardrail breached",
-      message: `Net cash margin ${currentMarginPct.toFixed(1)}% is below guardrail ${guardrails.minMarginPct}% (last 3 days).`,
-      fingerprintKey: `guardrail_margin:${new Date().toISOString().slice(0, 10)}`,
-    });
-  }
-
-  if (guardrails.maxRtoPct > 0 && currentRtoPct > guardrails.maxRtoPct) {
-    candidates.push({
-      ruleKey: "guardrail_rto",
-      severity: currentRtoPct > guardrails.maxRtoPct * 1.3 ? "critical" : "warning",
-      title: "RTO guardrail breached",
-      message: `RTO rate ${currentRtoPct.toFixed(1)}% exceeds guardrail ${guardrails.maxRtoPct}% (last 3 days).`,
-      fingerprintKey: `guardrail_rto:${new Date().toISOString().slice(0, 10)}`,
-    });
-  }
-
-  if (guardrails.maxDiscountPct > 0 && currentDiscountPct > guardrails.maxDiscountPct) {
-    candidates.push({
-      ruleKey: "guardrail_discount",
-      severity: currentDiscountPct > guardrails.maxDiscountPct * 1.3 ? "critical" : "warning",
-      title: "Discount guardrail breached",
-      message: `Discount rate ${currentDiscountPct.toFixed(1)}% exceeds guardrail ${guardrails.maxDiscountPct}% (last 3 days).`,
-      fingerprintKey: `guardrail_discount:${new Date().toISOString().slice(0, 10)}`,
-    });
-  }
-
-  if (guardrails.maxRefundPct > 0 && currentRefundPct > guardrails.maxRefundPct) {
-    candidates.push({
-      ruleKey: "guardrail_refund",
-      severity: currentRefundPct > guardrails.maxRefundPct * 1.3 ? "critical" : "warning",
-      title: "Refund guardrail breached",
-      message: `Refund rate ${currentRefundPct.toFixed(1)}% exceeds guardrail ${guardrails.maxRefundPct}% (last 3 days).`,
-      fingerprintKey: `guardrail_refund:${new Date().toISOString().slice(0, 10)}`,
-    });
-  }
-
-  if (guardrails.maxCac > 0 && currentCac > guardrails.maxCac) {
-    candidates.push({
-      ruleKey: "guardrail_cac",
-      severity: currentCac > guardrails.maxCac * 1.3 ? "critical" : "warning",
-      title: "CAC guardrail breached",
-      message: `CAC INR ${currentCac.toFixed(0)} exceeds guardrail INR ${guardrails.maxCac.toFixed(0)} (last 3 days).`,
-      fingerprintKey: `guardrail_cac:${new Date().toISOString().slice(0, 10)}`,
-    });
-  }
-
-  const paidOrdersWithLanding = currentOrders.filter((row) => {
-    const source = String(row?.marketingSource || "").toLowerCase();
-    const isPaid = source && source !== "direct" && source !== "unknown";
-    return isPaid && row?.landingSite;
-  });
-  const landingMismatchCount = paidOrdersWithLanding.filter((row) => {
-    const type = landingPathType(row.landingSite);
-    return type === "home" || type === "other";
-  }).length;
-  const landingMismatchPct = paidOrdersWithLanding.length
-    ? (landingMismatchCount / paidOrdersWithLanding.length) * 100
-    : 0;
-  if (paidOrdersWithLanding.length >= 20 && landingMismatchPct >= 30) {
-    candidates.push({
-      ruleKey: "landing_mismatch",
-      severity: landingMismatchPct >= 50 ? "critical" : "warning",
-      title: "Landing page mismatch risk",
-      message: `${landingMismatchPct.toFixed(1)}% of paid orders landed on home or generic pages (${landingMismatchCount}/${paidOrdersWithLanding.length}).`,
-      fingerprintKey: `landing_mismatch:${new Date().toISOString().slice(0, 10)}`,
-    });
-  }
-
-  const multiSourceTouchpointCount = currentOrders.filter((row) => touchpointSources(row).size > 1).length;
-  const multiSourceTouchpointPct = currentOrders.length
-    ? (multiSourceTouchpointCount / currentOrders.length) * 100
-    : 0;
-  if (currentOrders.length >= 30 && multiSourceTouchpointPct >= 20) {
-    candidates.push({
-      ruleKey: "attribution_overlap",
-      severity: multiSourceTouchpointPct >= 35 ? "critical" : "warning",
-      title: "Attribution overlap risk",
-      message: `${multiSourceTouchpointPct.toFixed(1)}% of recent orders show multi-source touchpoints (${multiSourceTouchpointCount}/${currentOrders.length}).`,
-      fingerprintKey: `attribution_overlap:${new Date().toISOString().slice(0, 10)}`,
-    });
-  }
-
-  const fatigueRisks = await getCreativeFatigueRisks(shop, 14, "all");
-  if (fatigueRisks.length > 0) {
-    const criticalCount = fatigueRisks.filter((row) => row.severity === "critical").length;
-    const top = fatigueRisks[0];
-    const creativeLabel = top?.adName || top?.adId || "Top creative";
-    candidates.push({
-      ruleKey: "creative_fatigue",
-      severity: criticalCount > 0 || fatigueRisks.length >= 4 ? "critical" : "warning",
-      title: "Creative fatigue detected",
-      message: `${fatigueRisks.length} creatives show CTR decay. ${creativeLabel} is down ${Math.abs(top.ctrDeltaPct).toFixed(1)}% vs prior week.`,
-      fingerprintKey: `creative_fatigue:${new Date().toISOString().slice(0, 10)}`,
-    });
-
-    const actionsEnabled = String(process.env.CREATIVE_FATIGUE_ACTIONS_ENABLED || "true").toLowerCase() !== "false";
-    if (actionsEnabled) {
-      const actionTargets = fatigueRisks.slice(0, 6);
-      for (const risk of actionTargets) {
-        const label = risk.adName || risk.adId || "Creative";
-        // eslint-disable-next-line no-await-in-loop
-        await createCampaignActionItem(shop, {
-          source: risk.source,
-          campaignId: risk.campaignId,
-          campaignName: risk.campaignName,
-          reason: `Creative fatigue: ${label}`,
-          recommendedAction: risk.severity === "critical"
-            ? "Refresh creative, cap frequency, and recheck in 72h."
-            : "Test new hooks and cut spend by 10-20% if CTR keeps sliding.",
-          priority: risk.severity === "critical" ? "high" : "medium",
-        });
-      }
-    }
   }
 
   let created = 0;

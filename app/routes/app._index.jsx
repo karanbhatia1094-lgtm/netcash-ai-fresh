@@ -1,6 +1,6 @@
 import { json, redirect } from "@remix-run/node";
 import { Form, Link, useFetcher, useLoaderData, useLocation, useNavigate, useRevalidator, useRouteError, isRouteErrorResponse } from "@remix-run/react";
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { authenticate, BILLING_PLANS } from "../shopify.server";
 import { resolvePlanContext } from "../utils/plan.server";
 import { trackUiEvent } from "../utils/telemetry.client";
@@ -19,21 +19,15 @@ import {
   upsertSourceAdSpend,
   listConnectorCredentials,
   getRecentConnectorSyncRuns,
-  getCreativeFatigueRisks,
   prisma,
 } from "../utils/db.server";
 import { listReportSchedules } from "../utils/report-scheduler.server";
 import { enqueueJob } from "../utils/job-queue.server";
-import { isFeatureEnabledForShopAsync, resolveShopConfig, upsertShopSetting } from "../utils/release-control.server";
-import { isDevPreviewEnabled } from "../utils/dev-preview.server";
-import { getEmbeddedPassthrough, withEmbeddedContext } from "../utils/embedded-nav";
-import { getDeliveryOverview, getLatestDeliveryEvents } from "../utils/delivery-oms.server";
+import { isFeatureEnabledForShopAsync } from "../utils/release-control.server";
 
 const DAY_OPTIONS = [7, 30, 90, 365];
 const CUSTOMER_360_LOOKBACK_MIN_DAYS = 30;
 const CUSTOMER_360_LOOKBACK_MAX_DAYS = 730;
-const DASHBOARD_ORDERS_MAX = Math.max(500, Number(process.env.HOME_DASHBOARD_ORDERS_MAX || 2500));
-const CUSTOMER_360_ANALYSIS_MAX = Math.max(1000, Number(process.env.HOME_CUSTOMER_360_ANALYSIS_MAX || 6000));
 
 function resolveCustomer360LookbackDays() {
   const raw = Number(process.env.CUSTOMER_360_LOOKBACK_DAYS || 365);
@@ -198,35 +192,6 @@ function csvEscape(value) {
 
 function asCsv(rows) {
   return rows.map((row) => row.map(csvEscape).join(",")).join("\n");
-}
-
-function safeJsonParse(value, fallback) {
-  if (!value) return fallback;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return fallback;
-  }
-}
-
-async function buildSnapshot(shop, days = 30) {
-  const [orders, spendRows] = await Promise.all([
-    getOrders(shop, days, { limit: 5000 }),
-    getSourceMetrics(days),
-  ]);
-  const gross = (orders || []).reduce((sum, row) => sum + Number(row.grossValue || 0), 0);
-  const net = (orders || []).reduce((sum, row) => sum + Number(row.netCash || 0), 0);
-  const spend = (spendRows || []).reduce((sum, row) => sum + Number(row.adSpend || 0), 0);
-  const blendedRoas = spend > 0 ? net / spend : 0;
-  const marginPct = gross > 0 ? (net / gross) * 100 : 0;
-  return {
-    days,
-    gross,
-    net,
-    spend,
-    blendedRoas,
-    marginPct,
-  };
 }
 
 export async function action({ request }) {
@@ -427,43 +392,6 @@ export async function action({ request }) {
     return redirect(`/app?days=${safeDays}`);
   }
 
-  if (intent === "add-experiment") {
-    const title = String(formData.get("title") || "").trim();
-    const hypothesis = String(formData.get("hypothesis") || "").trim();
-    const expected = String(formData.get("expected") || "").trim();
-    const startDate = String(formData.get("start_date") || "").trim();
-    if (!title) {
-      return redirect(`/app?days=${safeDays}`);
-    }
-    const config = await resolveShopConfig(shop, { growth_experiment_log: "[]" });
-    const current = safeJsonParse(config.growth_experiment_log, []);
-    const baseline = await buildSnapshot(shop, 30);
-    const next = [
-      {
-        id: `exp_${Date.now()}`,
-        title,
-        hypothesis,
-        expected,
-        startDate: startDate || new Date().toISOString().slice(0, 10),
-        status: "active",
-        createdAt: new Date().toISOString(),
-        baseline,
-      },
-      ...current,
-    ].slice(0, 25);
-    await upsertShopSetting(shop, "growth_experiment_log", JSON.stringify(next));
-    return redirect(`/app?days=${safeDays}`);
-  }
-
-  if (intent === "close-experiment") {
-    const id = String(formData.get("id") || "");
-    const config = await resolveShopConfig(shop, { growth_experiment_log: "[]" });
-    const current = safeJsonParse(config.growth_experiment_log, []);
-    const next = current.map((row) => (row.id === id ? { ...row, status: "closed" } : row));
-    await upsertShopSetting(shop, "growth_experiment_log", JSON.stringify(next));
-    return redirect(`/app?days=${safeDays}`);
-  }
-
   if (intent === "save-layout") {
     const raw = String(formData.get("layout") || "{}");
     let layout = {};
@@ -485,119 +413,14 @@ export async function loader({ request }) {
   const url = new URL(request.url);
   const requestedDays = Number(url.searchParams.get("days") || 30);
   const days = DAY_OPTIONS.includes(requestedDays) ? requestedDays : 30;
-  const rawSourcesParam = String(url.searchParams.get("sources") || "all");
-  const selectedSources = rawSourcesParam
-    .split(",")
-    .map((row) => row.trim().toLowerCase())
-    .filter(Boolean);
-  const normalizedSelectedSources = selectedSources.length ? [...new Set(selectedSources)] : ["all"];
-  const includeAllSources = normalizedSelectedSources.includes("all");
-  const sourceFilterSet = new Set(normalizedSelectedSources.filter((row) => row !== "all"));
   const planContext = await resolvePlanContext(
     billing,
     process.env.NODE_ENV !== "production",
     BILLING_PLANS,
     shop,
   );
-  const devPreview = isDevPreviewEnabled();
   const asyncOrderSyncEnabled = await isFeatureEnabledForShopAsync(shop, "home_async_order_sync", true);
   const syncIntervalMins = Math.max(5, Number(process.env.ORDER_SYNC_MIN_INTERVAL_MINUTES || 30));
-  const lookbackDays = resolveCustomer360LookbackDays();
-
-  if (devPreview) {
-    const zeroWindow = (windowDays) => ({
-      windowDays,
-      currentNet: 0,
-      prevNet: 0,
-      netDeltaPct: 0,
-      currentRoas: 0,
-      prevRoas: 0,
-      roasDeltaPct: 0,
-      weekdayMixDeltaPct: 0,
-    });
-    return {
-      shop,
-      planContext,
-      sync: {
-        asyncOrderSyncEnabled: false,
-        enqueued: false,
-        lastSyncAt: null,
-        intervalMinutes: syncIntervalMins,
-      },
-      days,
-      defaultSpendDate: new Date().toISOString().slice(0, 10),
-      orders: [],
-      metrics: {
-        grossRevenue: 0,
-        netCash: 0,
-        adSpend: 0,
-        roas: 0,
-        realRoas: 0,
-        blendedRoas: 0,
-        orderCount: 0,
-        netCashPerOrder: 0,
-        avgOrderValue: 0,
-        profitMarginPct: 0,
-        attributionGapPct: 0,
-        rtoPct: 0,
-        refundPct: 0,
-        discountPct: 0,
-        creativeFatigueCount: 0,
-      },
-      sourceBreakdown: [],
-      selectedSources: normalizedSelectedSources,
-      availableSources: [],
-      customerProfiles: [],
-      customerHistoryByOrderId: {},
-      highRtoItems: [],
-      highRtoPincodes: [],
-      spendHistory: [],
-      alerts: [],
-      campaignAnomalies: [],
-      attributionModels: [],
-      incrementality: {
-        paidOrders: 0,
-        directOrders: 0,
-        paidNetAvg: 0,
-        directNetAvg: 0,
-        estimatedIncrementalNet: 0,
-        estimatedUpliftPct: 0,
-        cohorts: [],
-      },
-      savedLayout: null,
-      stopCampaigns: [],
-      permissions: {
-        hasMetaConnector: false,
-        hasGoogleConnector: false,
-      },
-      connectorSnapshotFallback: {
-        lastSuccessAt: null,
-        lastSuccessProvider: null,
-        lastFailedAt: null,
-        lastFailedProvider: null,
-      },
-      benchmarkMode: {
-        seven: zeroWindow(7),
-        thirty: zeroWindow(30),
-      },
-      dataMode: {
-        dashboardOrdersLoaded: 0,
-        dashboardOrdersAvailable: 0,
-        customerOrdersLoaded: 0,
-        customerOrdersAvailable: 0,
-        dashboardIsSampled: false,
-        customerAnalysisIsSampled: false,
-        dashboardLimit: DASHBOARD_ORDERS_MAX,
-        customerAnalysisLimit: CUSTOMER_360_ANALYSIS_MAX,
-        lookbackDays,
-      },
-      scheduledReports: [],
-      experiments: [],
-      deliveryOverview: { total: 0, breakdown: [] },
-      deliveryEvents: [],
-      previewMode: devPreview,
-    };
-  }
   const latestOrder = await prisma.netCashOrder.findFirst({
     where: { shop },
     select: { updatedAt: true, createdAt: true },
@@ -624,45 +447,11 @@ export async function loader({ request }) {
     }
   }
 
-  const orderSourceFilter = includeAllSources ? {} : { marketingSource: { in: [...sourceFilterSet] } };
-  const [ordersRaw, allOrdersRaw, totalOrdersInWindow, totalOrdersInLookback] = await Promise.all([
-    getOrders(shop, days, { limit: DASHBOARD_ORDERS_MAX }),
-    getOrders(shop, lookbackDays, { limit: CUSTOMER_360_ANALYSIS_MAX }),
-    prisma.netCashOrder.count({
-      where: {
-        shop,
-        createdAt: {
-          gte: new Date(Date.now() - days * 24 * 60 * 60 * 1000),
-        },
-        ...orderSourceFilter,
-      },
-    }),
-    prisma.netCashOrder.count({
-      where: {
-        shop,
-        createdAt: {
-          gte: new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000),
-        },
-        ...orderSourceFilter,
-      },
-    }),
-  ]);
-  const sourceOfOrder = (order) => String(order?.marketingSource || "unknown").toLowerCase();
-  const orders = includeAllSources
-    ? ordersRaw
-    : ordersRaw.filter((order) => sourceFilterSet.has(sourceOfOrder(order)));
-  const allOrders = includeAllSources
-    ? allOrdersRaw
-    : allOrdersRaw.filter((order) => sourceFilterSet.has(sourceOfOrder(order)));
+  const orders = await getOrders(shop, days);
+  const allOrders = await getOrders(shop, resolveCustomer360LookbackDays());
   const { profiles: customerProfiles, byOrderId: customerHistoryByOrderId } = buildCustomerProfilesFromOrders(allOrders);
-  const sourceMetricsAll = await getSourceMetrics(days);
-  const sourceMetrics = includeAllSources
-    ? sourceMetricsAll
-    : sourceMetricsAll.filter((row) => sourceFilterSet.has(String(row.source || "").toLowerCase()));
-  const spendHistoryAll = await getSpendEntries(days);
-  const spendHistory = includeAllSources
-    ? spendHistoryAll
-    : spendHistoryAll.filter((row) => sourceFilterSet.has(String(row.source || "").toLowerCase()));
+  const sourceMetrics = await getSourceMetrics(days);
+  const spendHistory = await getSpendEntries(days);
   const adSpendBySource = new Map(
     sourceMetrics.map((metric) => [metric.source.toLowerCase(), metric.adSpend || 0]),
   );
@@ -680,17 +469,6 @@ export async function loader({ request }) {
   const roas = adSpend > 0 ? totals.grossRevenue / adSpend : 0;
   const realRoas = adSpend > 0 ? totals.netCash / adSpend : 0;
   const orderCount = orders.length;
-  const discountTotal = orders.reduce((sum, row) => sum + Number(row.discountTotal || 0), 0);
-  const refundTotal = orders.reduce((sum, row) => sum + Number(row.refundTotal || 0), 0);
-  const rtoCount = orders.filter((row) => row.isRTO || row.rtoTotal > 0).length;
-  const discountPct = totals.grossRevenue > 0 ? (discountTotal / totals.grossRevenue) * 100 : 0;
-  const refundPct = totals.grossRevenue > 0 ? (refundTotal / totals.grossRevenue) * 100 : 0;
-  const rtoPct = orderCount > 0 ? (rtoCount / orderCount) * 100 : 0;
-  const attributionMissingCount = orders.filter(
-    (row) => !row.utmSource && !row.campaignId && !row.campaignName && !row.clickId,
-  ).length;
-  const attributionGapPct = orderCount > 0 ? (attributionMissingCount / orderCount) * 100 : 0;
-  const blendedRoas = realRoas;
   const netCashPerOrder = orderCount > 0 ? totals.netCash / orderCount : 0;
   const avgOrderValue = orderCount > 0 ? totals.grossRevenue / orderCount : 0;
   const profitMarginPct = totals.grossRevenue > 0 ? (totals.netCash / totals.grossRevenue) * 100 : 0;
@@ -720,10 +498,6 @@ export async function loader({ request }) {
   }
 
   const sourceBreakdown = [...sourceMap.values()].sort((a, b) => b.netCash - a.netCash);
-  const availableSources = [...new Set([
-    ...(sourceMetricsAll || []).map((row) => String(row.source || "").toLowerCase()),
-    ...(allOrdersRaw || []).map((row) => String(row.marketingSource || "unknown").toLowerCase()),
-  ])].filter(Boolean).sort();
 
   const riskOrders = orders.filter(
     (order) => order.isRTO || order.rtoTotal > 0 || order.isReturned || order.returnTotal > 0 || order.refundTotal > 0,
@@ -1018,12 +792,7 @@ export async function loader({ request }) {
   const recentConnectorRuns = await getRecentConnectorSyncRuns(shop, 20);
   const lastConnectorSuccess = (recentConnectorRuns || []).find((row) => row.status === "success") || null;
   const lastConnectorFailure = (recentConnectorRuns || []).find((row) => row.status === "failed") || null;
-  const campaignPerformance = await getCampaignPerformance(
-    shop,
-    days,
-    includeAllSources ? "all" : [...sourceFilterSet],
-  );
-  const creativeFatigue = await getCreativeFatigueRisks(shop, days, "all");
+  const campaignPerformance = await getCampaignPerformance(shop, days, "all");
   const stopCampaigns = (campaignPerformance?.rows || [])
     .filter((row) => row.orders >= 1 && (row.realRoas < 1 || row.netCash < 0))
     .sort((a, b) => {
@@ -1042,21 +811,7 @@ export async function loader({ request }) {
   const hasMetaConnector = connectorCredentials.some((row) => row.provider === "meta_ads" && row.accessToken);
   const hasGoogleConnector = connectorCredentials.some((row) => row.provider === "google_ads" && row.accessToken);
 
-  const benchmarkSpendAll = await getSpendEntries(120);
-  const benchmarkSpend = includeAllSources
-    ? benchmarkSpendAll
-    : benchmarkSpendAll.filter((row) => sourceFilterSet.has(String(row.source || "").toLowerCase()));
-  let deliveryOverview = { total: 0, breakdown: [] };
-  let deliveryEvents = [];
-  try {
-    [deliveryOverview, deliveryEvents] = await Promise.all([
-      getDeliveryOverview(shop),
-      getLatestDeliveryEvents(shop, 8),
-    ]);
-  } catch (error) {
-    deliveryOverview = { total: 0, breakdown: [] };
-    deliveryEvents = [];
-  }
+  const benchmarkSpend = await getSpendEntries(120);
   const compareWindow = (windowDays) => {
     const nowTs = Date.now();
     const dayMs = 24 * 60 * 60 * 1000;
@@ -1096,25 +851,6 @@ export async function loader({ request }) {
     };
   };
 
-  const shopConfig = await resolveShopConfig(shop, { growth_experiment_log: "[]" });
-  const experimentSnapshot = await buildSnapshot(shop, 30);
-  const experiments = safeJsonParse(shopConfig.growth_experiment_log, []).map((row) => {
-    const baseline = row.baseline || null;
-    if (!baseline) return row;
-    const deltaNet = experimentSnapshot.net - baseline.net;
-    const deltaRoas = experimentSnapshot.blendedRoas - baseline.blendedRoas;
-    const deltaMargin = experimentSnapshot.marginPct - baseline.marginPct;
-    return {
-      ...row,
-      current: experimentSnapshot,
-      delta: {
-        net: deltaNet,
-        blendedRoas: deltaRoas,
-        marginPct: deltaMargin,
-      },
-    };
-  });
-
   return {
     shop,
     planContext,
@@ -1133,21 +869,13 @@ export async function loader({ request }) {
       adSpend,
       roas,
       realRoas,
-      blendedRoas,
       orderCount,
       netCashPerOrder,
       avgOrderValue,
       profitMarginPct,
-      attributionGapPct,
-      rtoPct,
-      refundPct,
-      discountPct,
-      creativeFatigueCount: Array.isArray(creativeFatigue) ? creativeFatigue.length : 0,
     },
-      sourceBreakdown,
-      selectedSources: normalizedSelectedSources,
-      availableSources,
-      customerProfiles,
+    sourceBreakdown,
+    customerProfiles,
     customerHistoryByOrderId,
     highRtoItems,
     highRtoPincodes,
@@ -1180,54 +908,12 @@ export async function loader({ request }) {
       seven: compareWindow(7),
       thirty: compareWindow(30),
     },
-    dataMode: {
-      dashboardOrdersLoaded: orders.length,
-      dashboardOrdersAvailable: Number(totalOrdersInWindow || 0),
-      customerOrdersLoaded: allOrders.length,
-      customerOrdersAvailable: Number(totalOrdersInLookback || 0),
-      dashboardIsSampled: Number(totalOrdersInWindow || 0) > orders.length,
-      customerAnalysisIsSampled: Number(totalOrdersInLookback || 0) > allOrders.length,
-      dashboardLimit: DASHBOARD_ORDERS_MAX,
-      customerAnalysisLimit: CUSTOMER_360_ANALYSIS_MAX,
-      lookbackDays,
-    },
     scheduledReports: await listReportSchedules(shop, "home"),
-    experiments,
-    deliveryOverview,
-    deliveryEvents,
-    previewMode: devPreview,
   };
 }
 
 function money(value) {
   return `INR ${Number(value || 0).toLocaleString()}`;
-}
-
-function wilsonCi(successes, total, z = 1.96) {
-  const n = Math.max(0, Number(total || 0));
-  if (n <= 0) return { low: 0, high: 0, mean: 0 };
-  const s = Math.max(0, Math.min(n, Number(successes || 0)));
-  const p = s / n;
-  const z2 = z * z;
-  const denom = 1 + z2 / n;
-  const center = (p + z2 / (2 * n)) / denom;
-  const margin = (z / denom) * Math.sqrt((p * (1 - p) + z2 / (4 * n)) / n);
-  return {
-    low: Math.max(0, center - margin),
-    high: Math.min(1, center + margin),
-    mean: p,
-  };
-}
-
-function normalCi(mean, stdDev, n, z = 1.96) {
-  const safeN = Math.max(1, Number(n || 0));
-  const safeStd = Math.max(0, Number(stdDev || 0));
-  const margin = z * (safeStd / Math.sqrt(safeN));
-  return {
-    low: mean - margin,
-    high: mean + margin,
-    mean,
-  };
 }
 
 function parseTouchpoints(value) {
@@ -1238,32 +924,6 @@ function parseTouchpoints(value) {
   } catch {
     return [];
   }
-}
-
-function landingPathType(value) {
-  if (!value) return "unknown";
-  try {
-    const path = new URL(value, "https://example.com").pathname || "";
-    const normalized = path.toLowerCase();
-    if (!normalized || normalized === "/") return "home";
-    if (normalized.startsWith("/products/")) return "product";
-    if (normalized.startsWith("/collections/")) return "collection";
-    if (normalized.startsWith("/pages/")) return "page";
-    return "other";
-  } catch {
-    return "unknown";
-  }
-}
-
-function touchpointSources(order) {
-  const sources = new Set();
-  const base = String(order?.marketingSource || "").toLowerCase();
-  if (base) sources.add(base);
-  for (const touch of parseTouchpoints(order?.touchpointsJson)) {
-    const source = String(touch?.source || touch?.tool || "").toLowerCase();
-    if (source) sources.add(source);
-  }
-  return sources;
 }
 
 function formatDateTime(value) {
@@ -1378,8 +1038,6 @@ export default function Index() {
     orders,
     metrics,
     sourceBreakdown,
-    selectedSources: selectedSourcesFromLoader,
-    availableSources,
     customerProfiles,
     customerHistoryByOrderId,
     highRtoItems,
@@ -1392,31 +1050,19 @@ export default function Index() {
     savedLayout,
     stopCampaigns,
     permissions,
-    deliveryOverview,
-    deliveryEvents,
-      connectorSnapshotFallback,
-      benchmarkMode,
-      dataMode,
-      scheduledReports,
-      experiments,
-      previewMode,
-    } = useLoaderData();
+    connectorSnapshotFallback,
+    benchmarkMode,
+    scheduledReports,
+  } = useLoaderData();
   const tierKey = String(planContext?.tier || "basic").toLowerCase();
   const tierLabelMap = { basic: "Starter", pro: "Pro", premium: "Premium" };
   const tierLabel = (tierLabelMap[tierKey] || "Starter").toUpperCase();
-  const hasPro =
-    !!planContext?.hasPro ||
-    !!planContext?.hasPremium ||
-    String(planContext?.tier || "").toLowerCase() === "premium";
-  const hasPremium =
-    !!planContext?.hasPremium ||
-    String(planContext?.tier || "").toLowerCase() === "premium";
+  const hasPro = !!planContext?.hasPro;
+  const hasPremium = !!planContext?.hasPremium;
   const [expandedOrderId, setExpandedOrderId] = useState(null);
   const [selectedOrder360Id, setSelectedOrder360Id] = useState(null);
   const layoutSaver = useFetcher();
   const scheduleFetcher = useFetcher();
-  const embeddedPassthroughQuery = getEmbeddedPassthrough(location.search);
-  const withEmbedded = useCallback((href) => withEmbeddedContext(href, embeddedPassthroughQuery), [embeddedPassthroughQuery]);
   const [layout, setLayout] = useState({
     ai: true,
     alerts: true,
@@ -1433,13 +1079,9 @@ export default function Index() {
   const [dashboardView, setDashboardView] = useState("overview");
   const [dashboardPreset, setDashboardPreset] = useState("founder");
   const [presetToast, setPresetToast] = useState("");
-  const [densityMode, setDensityMode] = useState("auto");
   const [tableDensity, setTableDensity] = useState("comfortable");
   const [goalTargets, setGoalTargets] = useState({ netCash: 500000, roas: 3, cac: 800 });
   const [benchmarkWindow, setBenchmarkWindow] = useState("seven");
-  const [showFilterDrawer, setShowFilterDrawer] = useState(false);
-  const [savedViews, setSavedViews] = useState([]);
-  const [viewDraftName, setViewDraftName] = useState("");
   const [savedReports, setSavedReports] = useState(Array.isArray(scheduledReports) ? scheduledReports : []);
   const [reportDraft, setReportDraft] = useState({ name: "", frequency: "weekly", email: "" });
   const [customerColumns, setCustomerColumns] = useState({
@@ -1448,53 +1090,9 @@ export default function Index() {
   });
   const [showSkeleton, setShowSkeleton] = useState(true);
   const [installPromptOpen, setInstallPromptOpen] = useState(false);
-  const planMenuButtonRef = useRef(null);
-  const refreshButtonRef = useRef(null);
-  const [visibleOrdersCount, setVisibleOrdersCount] = useState(100);
-  const [sourceSearch, setSourceSearch] = useState("");
-  const [multiSourceOpen, setMultiSourceOpen] = useState(false);
-  const [selectedSources, setSelectedSources] = useState(selectedSourcesFromLoader || ["all"]);
+  const [planMenuOpen, setPlanMenuOpen] = useState(false);
   const navigate = useNavigate();
-  const isOverviewView = dashboardView === "overview";
-  const isActionsView = dashboardView === "operations";
-  const isDeepDiveView = dashboardView === "insights";
-  const experimentRows = Array.isArray(experiments) ? experiments : [];
-  const savedViewsKey = `nc_home_saved_views_${String(shop || "global").toLowerCase()}`;
-  const applyViewSessionKey = `nc_home_apply_view_${String(shop || "global").toLowerCase()}`;
-  const defaultLandingKey = `nc_default_landing_${String(shop || "global").toLowerCase()}`;
-
-  const sourceOptions = [...new Set((availableSources || []).map((row) => String(row || "").toLowerCase()).filter(Boolean))].sort();
-  const isAllSources = selectedSources.includes("all");
-  const updateSourcesInUrl = (nextSources) => {
-    const params = new URLSearchParams(location.search);
-    params.set("sources", (nextSources || ["all"]).join(","));
-    navigate(`?${params.toString()}`, { preventScrollReset: true });
-  };
-  const toggleSource = (item) => {
-    const normalized = String(item || "").trim().toLowerCase();
-    if (!normalized) return;
-    if (normalized === "all") {
-      setSelectedSources(["all"]);
-      updateSourcesInUrl(["all"]);
-      return;
-    }
-    const current = isAllSources ? [] : [...selectedSources];
-    const exists = current.includes(normalized);
-    const next = exists ? current.filter((row) => row !== normalized) : [...current, normalized];
-    const finalNext = next.length ? next : ["all"];
-    setSelectedSources(finalNext);
-    updateSourcesInUrl(finalNext);
-  };
-  const filteredSourceOptions = sourceOptions.filter((item) =>
-    item.includes(String(sourceSearch || "").toLowerCase()));
-  const singleSourceValue =
-    isAllSources ? "all" : selectedSources.length === 1 ? selectedSources[0] : "custom";
-  const displaySourceBreakdown = isAllSources
-    ? (sourceBreakdown || [])
-    : (sourceBreakdown || []).filter((row) => selectedSources.includes(String(row?.source || "").toLowerCase()));
-  const displayCampaignAnomalies = isAllSources
-    ? (campaignAnomalies || [])
-    : (campaignAnomalies || []).filter((row) => selectedSources.includes(String(row?.source || "").toLowerCase()));
+  const planMenuRef = useRef(null);
 
   useEffect(() => {
     if (!layoutHydrated) {
@@ -1514,51 +1112,21 @@ export default function Index() {
     return () => clearTimeout(timer);
   }, [days]);
   useEffect(() => {
-    setSelectedSources(selectedSourcesFromLoader || ["all"]);
-  }, [selectedSourcesFromLoader]);
-  useEffect(() => {
-    const handler = (event) => {
-      const x = event.clientX;
-      const y = event.clientY;
-      const within = (el) => {
-        if (!el) return false;
-        const rect = el.getBoundingClientRect();
-        return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
-      };
-      if (within(planMenuButtonRef.current)) {
-        event.preventDefault();
-        event.stopPropagation();
-        const target = withEmbedded("/app/pricing");
-        window.location.href = target;
-      } else if (within(refreshButtonRef.current)) {
-        event.preventDefault();
-        event.stopPropagation();
-        trackUiEvent("refresh_clicked", { page: "home" });
-        revalidator.revalidate();
-      }
+    if (typeof document === "undefined") return undefined;
+    const onPointerDown = (event) => {
+      if (!planMenuRef.current) return;
+      if (planMenuRef.current.contains(event.target)) return;
+      setPlanMenuOpen(false);
     };
-    window.addEventListener("pointerdown", handler, true);
-    window.addEventListener("click", handler, true);
-    document.addEventListener("pointerdown", handler, true);
-    document.addEventListener("click", handler, true);
-    return () => {
-      window.removeEventListener("pointerdown", handler, true);
-      window.removeEventListener("click", handler, true);
-      document.removeEventListener("pointerdown", handler, true);
-      document.removeEventListener("click", handler, true);
-    };
-  }, [revalidator, withEmbedded]);
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, []);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
     const savedPreset = window.localStorage.getItem("nc_home_preset");
     if (savedPreset) setDashboardPreset(savedPreset);
   }, []);
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const saved = JSON.parse(window.localStorage.getItem(savedViewsKey) || "[]");
-    if (Array.isArray(saved)) setSavedViews(saved.slice(0, 20));
-  }, [savedViewsKey]);
   useEffect(() => {
     if (typeof window === "undefined") return;
     const savedGoals = JSON.parse(window.localStorage.getItem("nc_goal_targets") || "null");
@@ -1574,23 +1142,10 @@ export default function Index() {
   useEffect(() => {
     if (typeof window === "undefined") return;
     const media = window.matchMedia("(max-width: 980px)");
-    const readMode = () => {
-      const saved = String(window.localStorage.getItem("nc_density_mode") || "auto").toLowerCase();
-      return saved === "compact" || saved === "comfortable" ? saved : "auto";
-    };
-    const apply = (forcedMode) => {
-      const mode = forcedMode || readMode();
-      setDensityMode(mode);
-      setTableDensity(mode === "auto" ? (media.matches ? "compact" : "comfortable") : mode);
-    };
+    const apply = () => setTableDensity(media.matches ? "compact" : "comfortable");
     apply();
-    const onDensityChange = (event) => apply(event?.detail?.mode);
     media.addEventListener("change", apply);
-    window.addEventListener("nc-density-change", onDensityChange);
-    return () => {
-      media.removeEventListener("change", apply);
-      window.removeEventListener("nc-density-change", onDensityChange);
-    };
+    return () => media.removeEventListener("change", apply);
   }, []);
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -1641,14 +1196,6 @@ export default function Index() {
     link.remove();
     URL.revokeObjectURL(url);
   };
-  const applyDensityMode = (mode) => {
-    const normalized = mode === "compact" || mode === "comfortable" ? mode : "auto";
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem("nc_density_mode", normalized);
-      window.dispatchEvent(new CustomEvent("nc-density-change", { detail: { mode: normalized } }));
-    }
-    setDensityMode(normalized);
-  };
   const sectionViews = {
     alerts: ["overview"],
     anomalies: [],
@@ -1695,22 +1242,6 @@ export default function Index() {
   const clickIdCount = (orders || []).filter((row) => !!row.clickId).length;
   const firstPartySignalCount = (orders || []).filter((row) => !!row.landingSite || !!row.referringSite || !!row.clickId).length;
   const touchpointRichCount = (orders || []).filter((row) => parseTouchpoints(row.touchpointsJson).length >= 2).length;
-  const paidOrdersWithLanding = (orders || []).filter((row) => {
-    const source = String(row?.marketingSource || "").toLowerCase();
-    const isPaid = source && source !== "direct" && source !== "unknown";
-    return isPaid && row?.landingSite;
-  });
-  const landingMismatchCount = paidOrdersWithLanding.filter((row) => {
-    const type = landingPathType(row.landingSite);
-    return type === "home" || type === "other";
-  }).length;
-  const landingMismatchPct = paidOrdersWithLanding.length
-    ? (landingMismatchCount / paidOrdersWithLanding.length) * 100
-    : 0;
-  const multiSourceTouchpointCount = (orders || []).filter((row) => touchpointSources(row).size > 1).length;
-  const multiSourceTouchpointPct = totalOrdersCount
-    ? (multiSourceTouchpointCount / totalOrdersCount) * 100
-    : 0;
   const unattributedOrdersCount = Math.max(0, totalOrdersCount - mappedOrdersCount);
   const attributedNetCash = (orders || [])
     .filter((row) => row.campaignId || row.campaignName || row.clickId || parseTouchpoints(row.touchpointsJson).length > 0)
@@ -1724,91 +1255,9 @@ export default function Index() {
     0,
     Math.min(100, (fullUtmPct * 0.25) + (clickIdPct * 0.3) + (firstPartySignalPct * 0.25) + (touchpointRichPct * 0.2)),
   );
-  const freshDataScore = syncedMins == null ? 25 : Math.max(0, 100 - Math.min(100, syncedMins));
-  const truthConfidenceScore = Math.max(
-    0,
-    Math.min(100, (attributionCoveragePct * 0.4) + (dataDepthScore * 0.35) + (freshDataScore * 0.25)),
-  );
   const dominantSourceSharePct = Number(metrics?.netCash || 0) > 0
     ? ((Number(sourceBreakdown?.[0]?.netCash || 0) / Number(metrics.netCash)) * 100)
     : 0;
-  const totalRiskLoss = Number((orders || []).reduce((sum, row) => sum + Number(row.returnTotal || 0) + Number(row.rtoTotal || 0) + Number(row.refundTotal || 0), 0));
-  const grossSafe = Math.max(1, Number(metrics?.grossRevenue || 0));
-  const cashLeakagePct = (totalRiskLoss / grossSafe) * 100;
-  const customerOrderCounts = new Map();
-  for (const row of orders || []) {
-    const key = normalizeCustomerKey(row);
-    if (!key) continue;
-    customerOrderCounts.set(key, (customerOrderCounts.get(key) || 0) + 1);
-  }
-  const repeatOrdersCount = (orders || []).filter((row) => {
-    const key = normalizeCustomerKey(row);
-    return key ? (customerOrderCounts.get(key) || 0) > 1 : false;
-  }).length;
-  const riskOrdersCount = (orders || []).filter((row) => row.isRTO || row.rtoTotal > 0 || row.isReturned || row.returnTotal > 0 || row.refundTotal > 0).length;
-  const repeatOrderSharePct = totalOrdersCount > 0 ? (repeatOrdersCount / totalOrdersCount) * 100 : 0;
-  const burnVsCashRatio = Number(metrics?.netCash || 0) > 0 ? Number(metrics?.adSpend || 0) / Number(metrics.netCash) : 0;
-  const repeatShareCi = wilsonCi(repeatOrdersCount, totalOrdersCount);
-  const riskShareCi = wilsonCi(riskOrdersCount, totalOrdersCount);
-  const dailyNetByDay = new Map();
-  for (const row of orders || []) {
-    const dayKey = new Date(row.createdAt).toISOString().slice(0, 10);
-    dailyNetByDay.set(dayKey, (dailyNetByDay.get(dayKey) || 0) + Number(row.netCash || 0));
-  }
-  const dailyNetSeries = [...dailyNetByDay.values()];
-  const meanDailyNet = dailyNetSeries.length ? dailyNetSeries.reduce((sum, value) => sum + value, 0) / dailyNetSeries.length : 0;
-  const varianceDailyNet = dailyNetSeries.length > 1
-    ? dailyNetSeries.reduce((sum, value) => sum + Math.pow(value - meanDailyNet, 2), 0) / (dailyNetSeries.length - 1)
-    : 0;
-  const stdDailyNet = Math.sqrt(Math.max(0, varianceDailyNet));
-  const next7dNetMean = meanDailyNet * 7;
-  const next7dNetCi = normalCi(next7dNetMean, stdDailyNet * Math.sqrt(7), Math.max(1, dailyNetSeries.length));
-  const predictiveModels = [
-    {
-      label: "Next 7d Net Cash",
-      value: money(next7dNetMean),
-      range: `${money(next7dNetCi.low)} to ${money(next7dNetCi.high)} (95% CI)`,
-      status: next7dNetMean >= 0 ? "strong" : "risk",
-    },
-    {
-      label: "Repeat Order Probability",
-      value: `${(repeatShareCi.mean * 100).toFixed(1)}%`,
-      range: `${(repeatShareCi.low * 100).toFixed(1)}% to ${(repeatShareCi.high * 100).toFixed(1)}% (95% CI)`,
-      status: repeatShareCi.mean >= 0.35 ? "strong" : repeatShareCi.mean >= 0.2 ? "watch" : "risk",
-    },
-    {
-      label: "Return/RTO Risk Probability",
-      value: `${(riskShareCi.mean * 100).toFixed(1)}%`,
-      range: `${(riskShareCi.low * 100).toFixed(1)}% to ${(riskShareCi.high * 100).toFixed(1)}% (95% CI)`,
-      status: riskShareCi.mean <= 0.1 ? "strong" : riskShareCi.mean <= 0.18 ? "watch" : "risk",
-    },
-  ];
-  const premiumSignals = [
-    {
-      label: "Truth Confidence",
-      value: `${truthConfidenceScore.toFixed(0)} / 100`,
-      detail: "Blends attribution coverage, signal depth, and sync freshness.",
-      status: truthConfidenceScore >= 75 ? "strong" : truthConfidenceScore >= 55 ? "watch" : "risk",
-    },
-    {
-      label: "Cash Leakage",
-      value: `${cashLeakagePct.toFixed(1)}%`,
-      detail: `${money(totalRiskLoss)} lost to returns/RTO/refunds in selected window.`,
-      status: cashLeakagePct <= 8 ? "strong" : cashLeakagePct <= 14 ? "watch" : "risk",
-    },
-    {
-      label: "Repeat Revenue Engine",
-      value: `${repeatOrderSharePct.toFixed(0)}%`,
-      detail: `${repeatOrdersCount} repeat orders out of ${totalOrdersCount}. 95% CI ${(repeatShareCi.low * 100).toFixed(1)}-${(repeatShareCi.high * 100).toFixed(1)}%.`,
-      status: repeatOrderSharePct >= 35 ? "strong" : repeatOrderSharePct >= 20 ? "watch" : "risk",
-    },
-    {
-      label: "Burn vs Net Cash",
-      value: `${burnVsCashRatio.toFixed(2)}x`,
-      detail: "Ad spend as a multiple of net cash in current period.",
-      status: burnVsCashRatio <= 0.8 ? "strong" : burnVsCashRatio <= 1.2 ? "watch" : "risk",
-    },
-  ];
   const metaOrders = (orders || []).filter((row) => {
     const src = String(row?.marketingSource || "").toLowerCase();
     return src.includes("meta") || src.includes("facebook") || src.includes("instagram");
@@ -1850,18 +1299,6 @@ export default function Index() {
       setInstallPromptOpen(true);
     }
   }, [onboardingDone, onboardingSteps.length, permissions?.hasMetaConnector, permissions?.hasGoogleConnector, shop]);
-  useEffect(() => {
-    setVisibleOrdersCount(100);
-    setExpandedOrderId(null);
-  }, [days]);
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    if (location.search || location.hash) return;
-    const preferred = String(window.localStorage.getItem(defaultLandingKey) || "/app");
-    if (preferred && preferred.startsWith("/app") && preferred !== "/app") {
-      navigate(preferred, { replace: true, preventScrollReset: true });
-    }
-  }, [defaultLandingKey, location.hash, location.search, navigate]);
   const dismissInstallPrompt = () => {
     if (typeof window !== "undefined") {
       window.localStorage.setItem(`nc_onboarding_prompt_seen_${shop}`, "1");
@@ -1877,93 +1314,7 @@ export default function Index() {
     else next.set("quickFilter", value);
     return `?${next.toString()}`;
   };
-  const onChangeHomeWindow = (event) => {
-    const nextDays = Number(event.target.value || days);
-    if (!DAY_OPTIONS.includes(nextDays)) return;
-    const next = new URLSearchParams(location.search || "");
-    next.set("days", String(nextDays));
-    next.set("sources", (selectedSources || ["all"]).join(","));
-    navigate(`?${next.toString()}`, { preventScrollReset: true });
-  };
-  const onChangeHomeView = (event) => {
-    const value = String(event.target.value || "overview");
-    setDashboardView(value);
-  };
-  const onChangeHomeQuickFilter = (event) => {
-    const value = String(event.target.value || "all");
-    if (value === "reset") {
-      navigate(resetHomeFiltersHref, { preventScrollReset: true });
-      return;
-    }
-    navigate(quickFilterHref(value), { preventScrollReset: true });
-  };
-  const resetHomeFiltersHref = `?days=${days}&sources=${encodeURIComponent((selectedSources || ["all"]).join(","))}`;
-  const appliedFilterTokens = [
-    `Window: ${days}d`,
-    `View: ${dashboardView === "operations" ? "actions" : dashboardView === "insights" ? "deep dive" : "overview"}`,
-    `Traffic: ${quickFilter.replace("_", " ")}`,
-    `Sources: ${isAllSources ? "all" : selectedSources.join(", ")}`,
-  ];
-  const saveCurrentView = () => {
-    const name = String(viewDraftName || "").trim() || `Home ${days}d ${quickFilter}`;
-    const nextView = {
-      id: `hv-${Date.now()}`,
-      name,
-      days,
-      quickFilter,
-      dashboardView,
-      dashboardPreset,
-      benchmarkWindow,
-      createdAt: new Date().toISOString(),
-    };
-    setSavedViews((current) => {
-      const next = [nextView, ...current.filter((row) => row.name.toLowerCase() !== name.toLowerCase())].slice(0, 20);
-      if (typeof window !== "undefined") {
-        window.localStorage.setItem(savedViewsKey, JSON.stringify(next));
-      }
-      return next;
-    });
-    setViewDraftName("");
-    setPresetToast(`Saved view: ${name}`);
-    setTimeout(() => setPresetToast(""), 1400);
-  };
-  const applySavedView = useCallback((view) => {
-    if (!view) return;
-    const nextDays = DAY_OPTIONS.includes(Number(view.days)) ? Number(view.days) : days;
-    const nextQuickFilter = String(view.quickFilter || "all");
-    setDashboardView(String(view.dashboardView || "overview"));
-    setDashboardPreset(String(view.dashboardPreset || "founder"));
-    setBenchmarkWindow(String(view.benchmarkWindow || "seven"));
-    const next = new URLSearchParams();
-    next.set("days", String(nextDays));
-    if (nextQuickFilter !== "all") next.set("quickFilter", nextQuickFilter);
-    navigate(`?${next.toString()}`, { preventScrollReset: true });
-    setPresetToast(`Applied view: ${view.name || "Saved view"}`);
-    setTimeout(() => setPresetToast(""), 1400);
-  }, [days, navigate]);
-  const deleteSavedView = (id) => {
-    setSavedViews((current) => {
-      const next = current.filter((row) => row.id !== id);
-      if (typeof window !== "undefined") {
-        window.localStorage.setItem(savedViewsKey, JSON.stringify(next));
-      }
-      return next;
-    });
-    setPresetToast("Saved view removed");
-    setTimeout(() => setPresetToast(""), 1400);
-  };
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const raw = window.sessionStorage.getItem(applyViewSessionKey);
-    if (!raw) return;
-    window.sessionStorage.removeItem(applyViewSessionKey);
-    try {
-      const view = JSON.parse(raw);
-      applySavedView(view);
-    } catch {
-      // ignore invalid payload
-    }
-  }, [applyViewSessionKey, applySavedView]);
+  const resetHomeFiltersHref = `?days=${days}`;
   const setupWizardSteps = [
     { label: "Store connected", done: totalOrdersCount > 0, href: "/app" },
     { label: "Signal capture enabled", done: clickIdCount > 0 || firstPartySignalCount > 0, href: "/app/additional#storefront-signal" },
@@ -2013,8 +1364,6 @@ export default function Index() {
     `Recent ROAS delta ${Number(benchmark?.roasDeltaPct || 0).toFixed(1)}%, net delta ${Number(benchmark?.netDeltaPct || 0).toFixed(1)}%.`,
   ];
   const selectedOrderTimeline = selectedOrder360 ? buildCustomerTimeline(selectedOrder360) : [];
-  const displayedOrders = (orders || []).slice(0, visibleOrdersCount);
-  const hasMoreOrders = Number(orders?.length || 0) > displayedOrders.length;
   const selectedCustomerHistory =
     selectedOrder360 && customerHistoryByOrderId ? customerHistoryByOrderId[selectedOrder360.id] : null;
   const exportCustomer360Pdf = () => {
@@ -2198,7 +1547,7 @@ export default function Index() {
       type: "billing",
       title: "Billing status",
       detail: `${tierLabel} tier active`,
-      actionHref: "/app/pricing",
+      actionHref: "/app/billing?manage=1",
       actionLabel: "Manage Billing",
     },
   ]
@@ -2209,10 +1558,6 @@ export default function Index() {
     stopCandidates: (stopCampaigns || []).length,
     connectorsMissing: Number(!permissions?.hasMetaConnector) + Number(!permissions?.hasGoogleConnector),
   };
-  const deliveryBreakdown = (deliveryOverview?.breakdown || [])
-    .slice()
-    .sort((a, b) => b.count - a.count)
-    .slice(0, 6);
   const todayTasks = [
     { label: "Connect Meta + Google", done: !!permissions?.hasMetaConnector && !!permissions?.hasGoogleConnector, href: "/app/integrations?wizard=1" },
     { label: "Review active risk alerts", done: (actionCenter.openRisks || 0) === 0, href: "/app/alerts" },
@@ -2257,7 +1602,7 @@ export default function Index() {
 
   return (
     <div className={`nc-shell nc-home ${tableDensity === "compact" ? "nc-density-compact" : ""}`}>
-      {!previewMode && showSkeleton ? (
+      {showSkeleton ? (
         <div className="nc-section">
           <div className="nc-skeleton nc-skeleton-title" />
           <div className="nc-skeleton nc-skeleton-subtitle" />
@@ -2298,69 +1643,57 @@ export default function Index() {
         </h1>
         <div className="nc-top-actions">
           <span className="nc-fresh-badge">{tierLabel} tier</span>
-          <a
-            href={withEmbedded("/app/pricing")}
+          <div className="nc-plan-dropdown" ref={planMenuRef}>
+            <button
+              type="button"
+              className="nc-icon-btn"
+              aria-haspopup="menu"
+              aria-expanded={planMenuOpen}
+              onClick={() => setPlanMenuOpen((current) => !current)}
+            >
+              <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" className="nc-btn-icon">
+                <path d="M4 4.2h12a1 1 0 0 1 1 1v9.6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5.2a1 1 0 0 1 1-1zm1.5 3.4h9V6h-9zm0 3h5.2v-1.6H5.5z" />
+              </svg>
+              Manage plan
+            </button>
+            {planMenuOpen ? (
+              <div className="nc-plan-dropdown-menu" role="menu">
+                {[
+                  { key: "Basic Monthly", label: "Starter" },
+                  { key: "Pro Monthly", label: "Pro" },
+                  { key: "Premium Monthly", label: "Premium" },
+                ].map((plan) => (
+                  <Form key={plan.key} method="post" action="/app/billing" onSubmit={() => setPlanMenuOpen(false)}>
+                    <input type="hidden" name="plan" value={plan.key} />
+                    <button type="submit" className="nc-plan-dropdown-item" role="menuitem">
+                      {plan.label}
+                    </button>
+                  </Form>
+                ))}
+                <Link to="/app/billing?manage=1" className="nc-plan-dropdown-item nc-plan-dropdown-link" preventScrollReset onClick={() => setPlanMenuOpen(false)}>
+                  Review plan details
+                </Link>
+              </div>
+            ) : null}
+          </div>
+          <button
+            type="button"
             className="nc-icon-btn"
-            ref={planMenuButtonRef}
-            onClick={(event) => {
-              event.preventDefault();
-              const target = withEmbedded("/app/pricing");
-              window.location.href = target;
-            }}
-          >
-            <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" className="nc-btn-icon">
-              <path d="M4 4.2h12a1 1 0 0 1 1 1v9.6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5.2a1 1 0 0 1 1-1zm1.5 3.4h9V6h-9zm0 3h5.2v-1.6H5.5z" />
-            </svg>
-            Manage Billing
-          </a>
-          <a
-            href={withEmbedded(`/app?days=${days}`)}
-            className="nc-icon-btn"
-            onClick={(event) => {
-              event.preventDefault();
+            onClick={() => {
               trackUiEvent("refresh_clicked", { page: "home" });
               revalidator.revalidate();
             }}
-            ref={refreshButtonRef}
+            disabled={revalidator.state === "loading"}
           >
             <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" className="nc-btn-icon">
               <path d="M10 3a7 7 0 1 1-5.8 3.1H2.6V3.2h2.9v2.1A5.4 5.4 0 1 0 10 4.6c1.1 0 2.1.3 3 .9L12 6.8A3.7 3.7 0 0 0 10 6.2 3.8 3.8 0 1 0 13.8 10h1.8A5.6 5.6 0 1 1 10 4.4z" />
             </svg>
             {revalidator.state === "loading" ? "Refreshing..." : "Refresh now"}
-          </a>
+          </button>
           <span className={syncBadgeClass} title={syncTitle}>{syncLabel}</span>
         </div>
       </div>
       <p className="nc-subtitle">Profit command center with attribution depth, campaign actions, and connector health in one place.</p>
-      <div className="nc-card nc-section nc-glass nc-mission-control">
-        <div className="nc-section-head-inline">
-          <h2 style={{ marginBottom: 0 }}>Mission Control</h2>
-          <span className="nc-note">Premium D2C signal layer</span>
-        </div>
-        <div className="nc-grid-4">
-          {premiumSignals.map((signal) => (
-            <div key={signal.label} className={`nc-soft-box nc-premium-signal is-${signal.status}`}>
-              <strong>{signal.label}</strong>
-              <p className="nc-kpi-value" style={{ marginBottom: "4px" }}>{signal.value}</p>
-              <p className="nc-note" style={{ marginBottom: 0 }}>{signal.detail}</p>
-            </div>
-          ))}
-        </div>
-        <div className="nc-grid-4" style={{ marginTop: "10px" }}>
-          {predictiveModels.map((model) => (
-            <div key={model.label} className={`nc-soft-box nc-premium-signal is-${model.status}`}>
-              <strong>{model.label}</strong>
-              <p className="nc-kpi-value" style={{ marginBottom: "4px" }}>{model.value}</p>
-              <p className="nc-note" style={{ marginBottom: 0 }}>{model.range}</p>
-            </div>
-          ))}
-        </div>
-        {(dataMode?.dashboardIsSampled || dataMode?.customerAnalysisIsSampled) ? (
-          <p className="nc-note" style={{ marginTop: "10px", marginBottom: 0 }}>
-            Big-data mode: showing {dataMode.dashboardOrdersLoaded}/{dataMode.dashboardOrdersAvailable} recent orders and {dataMode.customerOrdersLoaded}/{dataMode.customerOrdersAvailable} customer-analysis orders to keep navigation fast. Export still supports full datasets.
-          </p>
-        ) : null}
-      </div>
       {connectorSnapshotFallback?.lastFailedAt ? (
         <div className="nc-card nc-section">
           <h3 style={{ marginTop: 0 }}>Connector Recovery Snapshot</h3>
@@ -2404,83 +1737,64 @@ export default function Index() {
         <div className="nc-control-strip" id="home-kpis" style={{ marginBottom: "12px" }}>
           <div className="nc-control-group">
             <span className="nc-note">Time window</span>
-            <select value={days} onChange={onChangeHomeWindow}>
+            <div className="nc-toolbar" style={{ marginBottom: 0 }}>
               {DAY_OPTIONS.map((option) => (
-                <option key={`home-days-${option}`} value={option}>{option}d</option>
+                <Link
+                  key={option}
+                  to={`?days=${option}`}
+                  className={`nc-chip ${option === days ? "is-active" : ""}`}
+                  preventScrollReset
+                >
+                  {option}d
+                </Link>
               ))}
-            </select>
+            </div>
           </div>
           <div className="nc-control-group">
             <span className="nc-note">View</span>
-            <select value={dashboardView} onChange={onChangeHomeView}>
-              <option value="overview">Overview</option>
-              <option value="operations">Actions</option>
-              <option value="insights">Deep Dive</option>
-            </select>
-          </div>
-          <div className="nc-control-group">
-            <span className="nc-note">Source</span>
-            <select
-              value={singleSourceValue}
-              onChange={(event) => {
-                const next = String(event.target.value || "all");
-                if (next === "custom") return;
-                toggleSource(next);
-              }}
-            >
-              <option value="all">All sources</option>
-              {sourceOptions.map((item) => (
-                <option key={`home-source-${item}`} value={item}>
-                  {String(item || "").replace(/_/g, " ")}
-                </option>
+            <div className="nc-toolbar" style={{ marginBottom: 0 }}>
+              {[
+                ["overview", "Overview"],
+                ["insights", "Insights"],
+                ["operations", "Operations"],
+              ].map(([key, label]) => (
+                <button
+                  key={key}
+                  type="button"
+                  className={`nc-chip ${dashboardView === key ? "is-active" : ""}`}
+                  onClick={() => setDashboardView(key)}
+                >
+                  {label}
+                </button>
               ))}
-              {singleSourceValue === "custom" ? <option value="custom">Multiple selected</option> : null}
-            </select>
-            <button
-              type="button"
-              className={`nc-chip ${multiSourceOpen ? "is-active" : ""}`}
-              onClick={() => setMultiSourceOpen((current) => !current)}
-              style={{ marginTop: "6px", justifyContent: "center" }}
-            >
-              {multiSourceOpen ? "Hide multi-select" : "Multi-select"}
-            </button>
-            {multiSourceOpen ? (
-              <div className="nc-source-picker-panel" style={{ marginTop: "8px" }}>
-                <input
-                  type="search"
-                  value={sourceSearch}
-                  onChange={(event) => setSourceSearch(event.target.value)}
-                  placeholder="Search source"
-                  aria-label="Search sources"
-                />
-                <label className="nc-inline-field">
-                  <input
-                    type="checkbox"
-                    checked={isAllSources}
-                    onChange={() => toggleSource("all")}
-                  />
-                  <span>All</span>
-                </label>
-                {filteredSourceOptions.map((item) => (
-                  <label key={`home-source-multi-${item}`} className="nc-inline-field">
-                    <input
-                      type="checkbox"
-                      checked={selectedSources.includes(item) && !isAllSources}
-                      onChange={() => toggleSource(item)}
-                    />
-                    <span style={{ textTransform: "capitalize" }}>{item}</span>
-                  </label>
-                ))}
-              </div>
-            ) : null}
+            </div>
           </div>
           <div className="nc-control-group">
-            <span className="nc-note">Display</span>
-            <select value={densityMode} onChange={(event) => applyDensityMode(String(event.target.value || "auto"))}>
-              <option value="auto">Auto</option>
-              <option value="comfortable">Comfortable</option>
-              <option value="compact">Compact</option>
-            </select>
+            <span className="nc-note">Preset</span>
+            <div className="nc-toolbar" style={{ marginBottom: 0 }}>
+              {[
+                ["founder", "Founder", "F"],
+                ["growth", "Growth", "G"],
+                ["ops", "Ops", "O"],
+                ["crm", "CRM", "C"],
+              ].map(([key, label, icon]) => (
+                <button
+                  key={key}
+                  type="button"
+                  className={`nc-chip ${dashboardPreset === key ? "is-active" : ""}`}
+                  onClick={() => applyPreset(key)}
+                >
+                  <span className="nc-chip-icon" aria-hidden="true">{icon}</span>
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="nc-control-group">
+            <span className="nc-note">Table density</span>
+            <div className="nc-toolbar" style={{ marginBottom: 0 }}>
+              <span className="nc-chip is-active">{tableDensity === "compact" ? "Auto: Compact" : "Auto: Comfortable"}</span>
+            </div>
           </div>
         </div>
         <div className="nc-kpi-grid">
@@ -2502,91 +1816,34 @@ export default function Index() {
           </div>
         </div>
       </div>
-        <div className="nc-toolbar nc-section nc-filter-bar" style={{ marginBottom: 0 }}>
-          <label className="nc-form-field nc-inline-field">
-            <span>Traffic filter</span>
-            <select value={quickFilter} onChange={onChangeHomeQuickFilter}>
-              <option value="all">All traffic</option>
-              <option value="paid">Only paid traffic</option>
-              <option value="repeat">Only repeat buyers</option>
+      <div className="nc-toolbar nc-section" style={{ marginBottom: 0 }}>
+        <label className="nc-home-quickfilter-mobile">
+          <span className="nc-note">Quick Filters</span>
+          <select
+            value={quickFilter}
+            onChange={(event) => {
+              if (event.target.value === "reset") {
+                navigate(resetHomeFiltersHref, { preventScrollReset: true });
+                return;
+              }
+              navigate(quickFilterHref(event.target.value), { preventScrollReset: true });
+            }}
+          >
+            <option value="all">All traffic</option>
+            <option value="paid">Only paid traffic</option>
+            <option value="repeat">Only repeat buyers</option>
             <option value="coupon">Only coupon users</option>
             <option value="mobile">Only mobile</option>
             <option value="reset">Reset all filters</option>
           </select>
         </label>
-        <label className="nc-form-field nc-inline-field">
-          <span>Saved view</span>
-          <select
-            value=""
-            onChange={(event) => {
-              const selected = savedViews.find((row) => row.id === String(event.target.value || ""));
-              if (selected) applySavedView(selected);
-            }}
-          >
-            <option value="">Select saved view</option>
-            {savedViews.map((row) => (
-              <option key={`home-view-${row.id}`} value={row.id}>{row.name}</option>
-            ))}
-          </select>
-        </label>
-          <button type="button" className="nc-chip" onClick={() => setShowFilterDrawer((current) => !current)}>
-            {showFilterDrawer ? "Hide drawer" : "Open drawer"}
-          </button>
-        </div>
-        <p className="nc-note" style={{ marginTop: "6px", marginBottom: 0 }}>
-          Tip: Use saved views to keep your preferred filters ready.
-        </p>
-      <div className="nc-toolbar nc-section nc-applied-filter-row" style={{ marginBottom: 0 }}>
-        {appliedFilterTokens.map((token) => (
-          <button
-            type="button"
-            key={`home-filter-token-${token}`}
-            className="nc-chip"
-            onClick={() => setShowFilterDrawer(true)}
-          >
-            {token}
-          </button>
-        ))}
+        <Link to={quickFilterHref("all")} preventScrollReset className={`nc-chip ${quickFilter === "all" ? "is-active" : ""}`}>All traffic</Link>
+        <Link to={quickFilterHref("paid")} preventScrollReset className={`nc-chip ${quickFilter === "paid" ? "is-active" : ""}`}>Only paid traffic</Link>
+        <Link to={quickFilterHref("repeat")} preventScrollReset className={`nc-chip ${quickFilter === "repeat" ? "is-active" : ""}`}>Only repeat buyers</Link>
+        <Link to={quickFilterHref("coupon")} preventScrollReset className={`nc-chip ${quickFilter === "coupon" ? "is-active" : ""}`}>Only coupon users</Link>
+        <Link to={quickFilterHref("mobile")} preventScrollReset className={`nc-chip ${quickFilter === "mobile" ? "is-active" : ""}`}>Only mobile</Link>
+        <Link to={resetHomeFiltersHref} preventScrollReset className="nc-chip">Reset all filters</Link>
       </div>
-      {showFilterDrawer ? (
-        <div className="nc-card nc-section nc-glass nc-filter-drawer">
-          <div className="nc-section-head-inline">
-            <h3 style={{ margin: 0 }}>Filter Drawer</h3>
-            <button type="button" className="nc-chip" onClick={() => navigate(resetHomeFiltersHref, { preventScrollReset: true })}>
-              Reset all filters
-            </button>
-          </div>
-          <div className="nc-toolbar" style={{ marginBottom: 0 }}>
-            <button type="button" className={`nc-chip ${quickFilter === "all" ? "is-active" : ""}`} onClick={() => navigate(quickFilterHref("all"), { preventScrollReset: true })}>All</button>
-            <button type="button" className={`nc-chip ${quickFilter === "paid" ? "is-active" : ""}`} onClick={() => navigate(quickFilterHref("paid"), { preventScrollReset: true })}>Paid</button>
-            <button type="button" className={`nc-chip ${quickFilter === "repeat" ? "is-active" : ""}`} onClick={() => navigate(quickFilterHref("repeat"), { preventScrollReset: true })}>Repeat</button>
-            <button type="button" className={`nc-chip ${quickFilter === "coupon" ? "is-active" : ""}`} onClick={() => navigate(quickFilterHref("coupon"), { preventScrollReset: true })}>Coupon</button>
-            <button type="button" className={`nc-chip ${quickFilter === "mobile" ? "is-active" : ""}`} onClick={() => navigate(quickFilterHref("mobile"), { preventScrollReset: true })}>Mobile</button>
-          </div>
-          <div className="nc-grid-4">
-            <label className="nc-form-field">Save current view
-              <input value={viewDraftName} onChange={(event) => setViewDraftName(event.target.value)} placeholder="Name this home view" />
-            </label>
-            <div className="nc-form-field">
-              <span>Actions</span>
-              <div className="nc-toolbar" style={{ marginBottom: 0 }}>
-                <button type="button" className="nc-chip" onClick={saveCurrentView}>Save view</button>
-                <button type="button" className="nc-chip" onClick={() => setShowFilterDrawer(false)}>Close drawer</button>
-              </div>
-            </div>
-          </div>
-          {savedViews.length ? (
-            <div className="nc-toolbar" style={{ marginBottom: 0 }}>
-              {savedViews.slice(0, 6).map((view) => (
-                <span key={`home-view-pill-${view.id}`} className="nc-saved-view-pill">
-                  <button type="button" className="nc-chip" onClick={() => applySavedView(view)}>{view.name}</button>
-                  <button type="button" className="nc-chip" onClick={() => deleteSavedView(view.id)}>Delete</button>
-                </span>
-              ))}
-            </div>
-          ) : null}
-        </div>
-      ) : null}
       {compareMode ? (
         <div className="nc-card nc-section nc-glass">
           <h3 style={{ marginTop: 0 }}>Compare Periods</h3>
@@ -2619,11 +1876,11 @@ export default function Index() {
           </div>
           <div className="nc-soft-box">
             <strong>Smart Alerts</strong>
-            <ul className="nc-smart-alerts-list" style={{ margin: "8px 0 0", paddingLeft: "18px" }}>
+            <ul style={{ margin: "8px 0 0", paddingLeft: "18px" }}>
               {smartAlerts.map((item) => (
                 <li key={item.title}>
                   <span>{item.title}: {item.reason} </span>
-                  <a className="nc-chip" href={withEmbedded(item.href)} style={{ marginLeft: "6px" }}>{item.cta}</a>
+                  <a className="nc-chip" href={item.href} style={{ marginLeft: "6px" }}>{item.cta}</a>
                 </li>
               ))}
             </ul>
@@ -2635,14 +1892,14 @@ export default function Index() {
             <ul style={{ margin: "10px 0 0", paddingLeft: "18px" }}>
               {setupWizardSteps.map((step) => (
                 <li key={step.label}>
-                  {step.done ? "Done" : "Open"}: <a href={withEmbedded(step.href)}>{step.label}</a>
+                  {step.done ? "Done" : "Open"}: <a href={step.href}>{step.label}</a>
                 </li>
               ))}
             </ul>
           </div>
         </div>
       </div> : null}
-      {(isOverviewView || isActionsView) ? <div className="nc-card nc-section nc-glass nc-action-center">
+      <div className="nc-card nc-section nc-glass nc-action-center">
         <div className="nc-section-head-inline">
           <h2>Action Center</h2>
           <span className="nc-note">Fast daily workflow for founders</span>
@@ -2652,16 +1909,16 @@ export default function Index() {
             <strong title="Review risk alerts and anomaly checks with one-click fixes.">Need attention now</strong>
             <p className="nc-note">{actionCenter.openRisks} risk signals need review.</p>
             <div className="nc-toolbar" style={{ marginBottom: 0 }}>
-              <a className="nc-chip" href={withEmbedded("/app/alerts")}>Review Alerts</a>
-              <a className="nc-chip" href={withEmbedded("/app/campaigns#campaign-stop-list")}>Review Campaign Fixes</a>
+              <a className="nc-chip" href="/app/alerts">Review Alerts</a>
+              <a className="nc-chip" href="/app/campaigns#campaign-stop-list">Review Campaign Fixes</a>
             </div>
           </div>
           <div className="nc-soft-box">
             <strong title="Daily actions that keep attribution and campaign quality healthy.">Today's checklist</strong>
             <p className="nc-note">{actionCenter.stopCandidates} campaigns flagged, {actionCenter.connectorsMissing} connectors missing.</p>
             <div className="nc-toolbar" style={{ marginBottom: 0 }}>
-              <Link className="nc-chip" to={withEmbedded("/app/campaigns#campaign-stop-list")} preventScrollReset>Stop List</Link>
-              <Link className="nc-chip" to={withEmbedded("/app/integrations?wizard=1")} preventScrollReset>Connect Sources</Link>
+              <Link className="nc-chip" to="/app/campaigns#campaign-stop-list" preventScrollReset>Stop List</Link>
+              <Link className="nc-chip" to="/app/integrations?wizard=1" preventScrollReset>Connect Sources</Link>
             </div>
           </div>
           <div className="nc-soft-box">
@@ -2672,62 +1929,8 @@ export default function Index() {
             </div>
           </div>
         </div>
-      </div> : null}
-      {(isOverviewView || isActionsView) ? <div className="nc-card nc-section nc-glass">
-        <div className="nc-section-head-inline">
-          <h2>Delivery Ops & OMS</h2>
-          <span className="nc-note">Live delivery/RTO and OMS status coverage</span>
-        </div>
-        <div className="nc-grid">
-          <div className="nc-soft-box">
-            <strong>Delivery status overview</strong>
-            <p className="nc-note">Shipments tracked: {deliveryOverview?.total || 0}</p>
-            <div className="nc-toolbar" style={{ marginBottom: 0 }}>
-              {deliveryBreakdown.length === 0 ? (
-                <span className="nc-note">No delivery events yet. Connect courier/OMS feeds.</span>
-              ) : (
-                deliveryBreakdown.map((row) => (
-                  <span key={`del-status-${row.status}`} className="nc-chip">{row.status}: {row.count}</span>
-                ))
-              )}
-            </div>
-            <p className="nc-note" style={{ marginTop: "8px" }}>
-              Ingest endpoint: <code>/api/delivery/ingest</code>
-            </p>
-          </div>
-          <div className="nc-soft-box">
-            <strong>Latest delivery events</strong>
-            <ul style={{ margin: "8px 0 0", paddingLeft: "18px" }}>
-              {(deliveryEvents || []).length === 0 ? (
-                <li>No recent delivery updates.</li>
-              ) : (
-                (deliveryEvents || []).map((event, idx) => (
-                  <li key={`del-event-${idx}`}>
-                    {event.orderNumber || event.awb || "Unknown"} · {event.provider || "provider"} · {event.event || "update"} · {event.location || "-"}
-                  </li>
-                ))
-              )}
-            </ul>
-            <p className="nc-note" style={{ marginTop: "8px" }}>
-              OMS endpoint: <code>/api/oms/ingest</code>
-            </p>
-          </div>
-          <div className="nc-soft-box">
-            <strong>Supported connectors (ready for data)</strong>
-            <p className="nc-note" style={{ marginBottom: "6px" }}>
-              Delivery: Shiprocket, Delhivery, NimbusPost, Ecom Express, Shadowfax, DTDC, Blue Dart, Xpressbees.
-            </p>
-            <p className="nc-note" style={{ marginBottom: 0 }}>
-              OMS: Unicommerce, Easycom, Vinculum, Increff, Uniware, ClickPost.
-            </p>
-            <div className="nc-toolbar" style={{ marginTop: "8px", marginBottom: 0 }}>
-              <Link className="nc-chip" to="/app/integrations?wizard=1" preventScrollReset>Configure Integrations</Link>
-              <a className="nc-chip" href="#delivery-integration-guide">View integration guide</a>
-            </div>
-          </div>
-        </div>
-      </div> : null}
-      {isActionsView ? <div className="nc-home-top-split nc-section">
+      </div>
+      <div className="nc-home-top-split nc-section">
         <div className="nc-card nc-glass nc-today-tasks">
           <div className="nc-section-head-inline">
             <h3 style={{ margin: 0 }}>Today Tasks</h3>
@@ -2749,22 +1952,22 @@ export default function Index() {
             <div className="nc-soft-box">
               <strong>What changed since yesterday</strong>
               <p className="nc-note">{dailyBrief.changed}</p>
-              <a className="nc-chip" href={withEmbedded("/app?days=7")}>Review 7d trend</a>
+              <a className="nc-chip" href="/app?days=7">Review 7d trend</a>
             </div>
             <div className="nc-soft-box">
               <strong>Top risk</strong>
               <p className="nc-note">{dailyBrief.risk}</p>
-              <a className="nc-chip" href={withEmbedded("/app/alerts")}>Review risk</a>
+              <a className="nc-chip" href="/app/alerts">Review risk</a>
             </div>
             <div className="nc-soft-box">
               <strong>Top growth action</strong>
               <p className="nc-note">{dailyBrief.growthAction}</p>
-              <a className="nc-chip" href={withEmbedded("/app/campaigns")}>Apply action</a>
+              <a className="nc-chip" href="/app/campaigns">Apply action</a>
             </div>
           </div>
         </div>
-      </div> : null}
-      {isOverviewView ? <div className="nc-card nc-section nc-glass">
+      </div>
+      <div className="nc-card nc-section nc-glass">
         <div className="nc-section-head-inline">
           <h2>Health Score</h2>
           <div className="nc-toolbar" style={{ marginBottom: 0 }}>
@@ -2807,8 +2010,8 @@ export default function Index() {
             </ul>
           </div>
         </div>
-      </div> : null}
-      {isOverviewView ? <div className="nc-card nc-section nc-glass">
+      </div>
+      <div className="nc-card nc-section nc-glass">
         <div className="nc-section-head-inline">
           <h2 title="Compare current period vs previous period baseline.">Benchmark Mode</h2>
           <div className="nc-toolbar" style={{ marginBottom: 0 }}>
@@ -2822,8 +2025,8 @@ export default function Index() {
           <div className="nc-soft-box"><strong>Weekday Mix Delta</strong><p className="nc-note">{Number(benchmark?.weekdayMixDeltaPct || 0).toFixed(1)}%</p></div>
           <div className="nc-soft-box"><strong>Current Net</strong><p className="nc-note">{money(benchmark?.currentNet || 0)}</p></div>
         </div>
-      </div> : null}
-      {isOverviewView ? <div id="goal-tracking" className="nc-card nc-section nc-glass">
+      </div>
+      <div id="goal-tracking" className="nc-card nc-section nc-glass">
         <div className="nc-section-head-inline">
           <h2 title="Set monthly goals and monitor projected completion.">Goal Tracking</h2>
           <span className="nc-note">Forecast to month-end</span>
@@ -2847,110 +2050,8 @@ export default function Index() {
           <div className="nc-note">CAC forecast: {money(forecastCac)} ({goalProgress.cac.toFixed(0)}%)</div>
           <progress max="100" value={Math.min(100, Math.max(0, goalProgress.cac))} />
         </div>
-      </div> : null}
-      {isOverviewView ? <div id="experiment-tracker" className="nc-card nc-section nc-glass">
-        <div className="nc-section-head-inline">
-          <h2>Experiment Tracker</h2>
-          <span className="nc-note">Log tests and track net-cash impact over time.</span>
-        </div>
-        <Form method="post" className="nc-grid-3" preventScrollReset>
-          <input type="hidden" name="intent" value="add-experiment" />
-          <label className="nc-form-field nc-inline-field">
-            <span>Experiment Title</span>
-            <input name="title" placeholder="Landing hero test" />
-          </label>
-          <label className="nc-form-field nc-inline-field">
-            <span>Hypothesis</span>
-            <input name="hypothesis" placeholder="Improve conversion by 10%" />
-          </label>
-          <label className="nc-form-field nc-inline-field">
-            <span>Expected Outcome</span>
-            <input name="expected" placeholder="+0.2x ROAS / +2% CVR" />
-          </label>
-          <label className="nc-form-field nc-inline-field">
-            <span>Start Date</span>
-            <input name="start_date" type="date" />
-          </label>
-          <div className="nc-toolbar" style={{ marginBottom: 0 }}>
-            <button type="submit" className="nc-chip">Add Experiment</button>
-          </div>
-        </Form>
-        <div style={{ marginTop: "12px" }}>
-          {experimentRows.length === 0 ? (
-            <div className="nc-empty-block">No experiments logged yet.</div>
-          ) : (
-            <table className="nc-table-card">
-              <thead>
-                <tr>
-                  <th style={{ textAlign: "left" }}>Title</th>
-                  <th style={{ textAlign: "left" }}>Hypothesis</th>
-                  <th style={{ textAlign: "left" }}>Expected</th>
-                  <th style={{ textAlign: "left" }}>Start</th>
-                  <th style={{ textAlign: "right" }}>Δ Net</th>
-                  <th style={{ textAlign: "right" }}>Δ ROAS</th>
-                  <th style={{ textAlign: "left" }}>Status</th>
-                  <th style={{ textAlign: "left" }}>Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                {experimentRows.map((row) => (
-                  <tr key={row.id}>
-                    <td>{row.title}</td>
-                    <td>{row.hypothesis || "-"}</td>
-                    <td>{row.expected || "-"}</td>
-                    <td>{row.startDate || "-"}</td>
-                    <td style={{ textAlign: "right" }}>{row.delta ? money(row.delta.net) : "-"}</td>
-                    <td style={{ textAlign: "right" }}>{row.delta ? `${row.delta.blendedRoas.toFixed(2)}x` : "-"}</td>
-                    <td>{row.status}</td>
-                    <td>
-                      {row.status === "active" ? (
-                        <Form method="post" preventScrollReset>
-                          <input type="hidden" name="intent" value="close-experiment" />
-                          <input type="hidden" name="id" value={row.id} />
-                          <button type="submit" className="nc-chip">Close</button>
-                        </Form>
-                      ) : (
-                        <span className="nc-note">Closed</span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
-      </div> : null}
-      {isOverviewView ? <div className="nc-card nc-section nc-glass">
-        <div className="nc-section-head-inline">
-          <h2>Executive Digest</h2>
-          <span className="nc-note">Copy-ready snapshot for founders.</span>
-        </div>
-        <div className="nc-soft-box">
-          <p className="nc-note" style={{ marginBottom: "6px" }}>
-            Net Cash: {money(metrics.netCash)} · Blended ROAS: {metrics.blendedRoas ? `${metrics.blendedRoas.toFixed(2)}x` : "-"} ·
-            Attribution Gap: {Number(metrics.attributionGapPct || 0).toFixed(1)}% · RTO: {Number(metrics.rtoPct || 0).toFixed(1)}% ·
-            Refund: {Number(metrics.refundPct || 0).toFixed(1)}% · Discount: {Number(metrics.discountPct || 0).toFixed(1)}% ·
-            Creative Fatigue: {Number(metrics.creativeFatigueCount || 0)}
-          </p>
-          <div className="nc-toolbar" style={{ marginBottom: 0 }}>
-            <button
-              type="button"
-              className="nc-chip"
-              onClick={() => {
-                if (typeof window === "undefined") return;
-                const text = `Executive Digest: Net Cash ${money(metrics.netCash)}, Blended ROAS ${metrics.blendedRoas ? metrics.blendedRoas.toFixed(2) : "-"}x, Attribution Gap ${Number(metrics.attributionGapPct || 0).toFixed(1)}%, RTO ${Number(metrics.rtoPct || 0).toFixed(1)}%, Refund ${Number(metrics.refundPct || 0).toFixed(1)}%, Discount ${Number(metrics.discountPct || 0).toFixed(1)}%, Creative Fatigue ${Number(metrics.creativeFatigueCount || 0)}.`;
-                navigator.clipboard?.writeText(text);
-              }}
-            >
-              Copy Digest
-            </button>
-            <button type="button" className="nc-chip" onClick={() => setDashboardView("operations")}>
-              Schedule Export
-            </button>
-          </div>
-        </div>
-      </div> : null}
-      {isOverviewView ? <div className="nc-card nc-section nc-glass">
+      </div>
+      <div className="nc-card nc-section nc-glass">
         <div className="nc-section-head-inline">
           <h2>Unified Timeline</h2>
           <span className="nc-note">Alerts, campaigns, billing, sync</span>
@@ -2968,9 +2069,8 @@ export default function Index() {
             ))}
           </tbody>
         </table>
-      </div> : null}
-      {isActionsView ? <details className="nc-card nc-section nc-glass" open>
-        <summary className="nc-details-summary">Saved Reports & Scheduled Export</summary>
+      </div>
+      <div className="nc-card nc-section nc-glass">
         <div className="nc-section-head-inline">
           <h2>Saved Reports & Scheduled Export</h2>
           <div className="nc-toolbar" style={{ marginBottom: 0 }}>
@@ -2999,24 +2099,24 @@ export default function Index() {
             <li key={row.id}>{row.label || row.name} {row.frequency ? `(${row.frequency} to ${row.email})` : ""}</li>
           ))}
         </ul>
-      </details> : null}
+      </div>
       {!permissions?.hasMetaConnector || !permissions?.hasGoogleConnector ? (
         <div className="nc-card nc-section nc-glass">
           <h3>Permission Check</h3>
           <p className="nc-note">Some connectors are missing. Connect now to unlock full attribution and campaign sync.</p>
           <div className="nc-toolbar" style={{ marginBottom: 0 }}>
-            {!permissions?.hasMetaConnector ? <a className="nc-chip" href={withEmbedded("/app/integrations?wizard=1")}>Connect Meta</a> : null}
-            {!permissions?.hasGoogleConnector ? <a className="nc-chip" href={withEmbedded("/app/integrations?wizard=1")}>Connect Google</a> : null}
+            {!permissions?.hasMetaConnector ? <a className="nc-chip" href="/app/integrations?wizard=1">Connect Meta</a> : null}
+            {!permissions?.hasGoogleConnector ? <a className="nc-chip" href="/app/integrations?wizard=1">Connect Google</a> : null}
           </div>
         </div>
       ) : null}
-      {isOverviewView ? <div className="nc-card nc-section nc-glass nc-health-row">
+      <div className="nc-card nc-section nc-glass nc-health-row">
         <div className="nc-health-item"><span>Orders connected</span><strong>{totalOrdersCount}</strong></div>
         <div className="nc-health-item"><span>UTM mapped</span><strong>{utmMappedPct.toFixed(0)}%</strong></div>
         <div className="nc-health-item"><span>Attribution coverage</span><strong>{attributionCoveragePct.toFixed(0)}%</strong></div>
         <div className="nc-health-item"><span>Last import source</span><strong style={{ textTransform: "capitalize" }}>{lastImportSource}</strong></div>
-      </div> : null}
-      {isDeepDiveView ? <div className="nc-card nc-section nc-glass nc-depth-grid">
+      </div>
+      <div className="nc-card nc-section nc-glass nc-depth-grid">
         <div className="nc-section-head-inline">
           <h2 title="How complete and reliable your attribution data is.">Data Depth</h2>
           <span className="nc-note">Signal quality for reliable decision-making</span>
@@ -3042,23 +2142,13 @@ export default function Index() {
             <p className="nc-kpi-value">{dominantSourceSharePct.toFixed(0)}%</p>
             <p className="nc-note">Share of net cash from your top source.</p>
           </div>
-          <div className="nc-soft-box">
-            <strong>Attribution Overlap Risk</strong>
-            <p className="nc-kpi-value">{multiSourceTouchpointPct.toFixed(0)}%</p>
-            <p className="nc-note">{multiSourceTouchpointCount} orders show multi-source touchpoints.</p>
-          </div>
-          <div className="nc-soft-box">
-            <strong>Landing Mismatch</strong>
-            <p className="nc-kpi-value">{landingMismatchPct.toFixed(0)}%</p>
-            <p className="nc-note">{landingMismatchCount} paid orders landed on home or generic pages.</p>
-          </div>
         </div>
         <div className="nc-toolbar" style={{ marginBottom: 0 }}>
-          <a className="nc-chip" href={withEmbedded("/app/intelligence")}>Review Intelligence Studio</a>
-          <a className="nc-chip" href={withEmbedded("/app/additional#utm-intelligence")}>Improve UTM Mapping</a>
+          <a className="nc-chip" href="/app/intelligence">Review Intelligence Studio</a>
+          <a className="nc-chip" href="/app/additional#utm-intelligence">Improve UTM Mapping</a>
         </div>
-      </div> : null}
-      {isDeepDiveView ? <div className="nc-card nc-section nc-glass nc-meta-recovery">
+      </div>
+      <div className="nc-card nc-section nc-glass nc-meta-recovery">
         <div className="nc-section-head-inline">
           <h2 title="Fallback workflow when Meta pixel/UTM visibility is incomplete.">Meta Signal Recovery</h2>
           <span className={`nc-fresh-badge ${metaRecoveryStatus === "Strong" ? "nc-sync-fresh" : metaRecoveryStatus === "Partial" ? "nc-sync-aging" : "nc-sync-stale"}`}>
@@ -3099,11 +2189,11 @@ export default function Index() {
           </ol>
         </div>
         <div className="nc-toolbar" style={{ marginBottom: 0 }}>
-          <a className="nc-chip" href={withEmbedded("/app/integrations?wizard=1")}>Connect Meta</a>
-          <a className="nc-chip" href={withEmbedded("/app/additional#tool-connectors")}>Review Attribution Templates</a>
+          <a className="nc-chip" href="/app/integrations?wizard=1">Connect Meta</a>
+          <a className="nc-chip" href="/app/additional#tool-connectors">Review Attribution Templates</a>
         </div>
-      </div> : null}
-      {isOverviewView ? <div className="nc-kpi-ribbon nc-section" aria-label="Sticky KPI ribbon">
+      </div>
+      <div className="nc-kpi-ribbon nc-section" aria-label="Sticky KPI ribbon">
         <div className={`nc-kpi-ribbon-item is-${trendToneFor("netCash", trendValueFor("netCash"))}`}>
           <span>Net Cash</span>
           <strong>{money(netCashValue)}</strong>
@@ -3152,8 +2242,8 @@ export default function Index() {
             </span>
           </div>
         </div>
-      </div> : null}
-      {isActionsView ? <div className="nc-card nc-section nc-glass nc-onboarding-strip">
+      </div>
+      <div className="nc-card nc-section nc-glass nc-onboarding-strip">
         <div className="nc-onboarding-head">
           <h3 style={{ margin: 0 }}>Onboarding</h3>
           <span className={syncBadgeClass} title={syncTitle}>{syncLabel}</span>
@@ -3167,7 +2257,7 @@ export default function Index() {
             </a>
           ))}
         </div>
-      </div> : null}
+      </div>
       {false ? <div className="nc-card nc-glass nc-section" id="founder-view">
         <div className="nc-section-head-inline">
           <h2 style={{ marginBottom: "8px" }}>Founder&apos;s View</h2>
@@ -3250,9 +2340,7 @@ export default function Index() {
           <div className="nc-control-group">
             <span className="nc-note">Table density</span>
             <div className="nc-toolbar" style={{ marginBottom: 0 }}>
-              <span className="nc-chip is-active">
-                {densityMode === "auto" ? `Auto: ${tableDensity === "compact" ? "Compact" : "Comfortable"}` : densityMode}
-              </span>
+              <span className="nc-chip is-active">{tableDensity === "compact" ? "Auto: Compact" : "Auto: Comfortable"}</span>
             </div>
           </div>
         </div>
@@ -3276,7 +2364,7 @@ export default function Index() {
         </div>
       </div> : null}
 
-      {isDeepDiveView ? <div id="high-value-customers" className="nc-card nc-section nc-glass nc-customer-intel">
+      <div id="high-value-customers" className="nc-card nc-section nc-glass nc-customer-intel">
         <div className="nc-section-head-inline">
           <h2>Customer Intelligence</h2>
           <div className="nc-toolbar" style={{ marginBottom: 0 }}>
@@ -3331,7 +2419,7 @@ export default function Index() {
                     <div className="nc-empty-state">
                       <div className="nc-empty-illus nc-empty-illus-home">C</div>
                       <div>No high-value cohort yet. Capture more attributed orders.</div>
-                      <a href={withEmbedded("/app/campaigns")} className="nc-chip">Review Campaigns</a>
+                      <a href="/app/campaigns" className="nc-chip">Review Campaigns</a>
                     </div>
                   </td>
                 </tr>
@@ -3371,7 +2459,7 @@ export default function Index() {
                       <div className="nc-empty-state">
                         <div className="nc-empty-illus nc-empty-illus-home">H</div>
                         <div className="nc-empty-mini">No risk items yet.</div>
-                        <a href={withEmbedded("/app/alerts")} className="nc-chip">Review Alerts</a>
+                        <a href="/app/alerts" className="nc-chip">Review Alerts</a>
                       </div>
                     </td>
                   </tr>
@@ -3404,7 +2492,7 @@ export default function Index() {
                       <div className="nc-empty-state">
                         <div className="nc-empty-illus nc-empty-illus-home">P</div>
                         <div className="nc-empty-mini">No risk pincodes yet.</div>
-                        <a href={withEmbedded("/app/alerts")} className="nc-chip">Review Alerts</a>
+                        <a href="/app/alerts" className="nc-chip">Review Alerts</a>
                       </div>
                     </td>
                   </tr>
@@ -3421,7 +2509,7 @@ export default function Index() {
             </table>
           </div>
         </div>
-      </div> : null}
+      </div>
 
       {false ? <div className="nc-card nc-section nc-control-strip" id="home-kpis">
         <div className="nc-control-group">
@@ -3559,12 +2647,12 @@ export default function Index() {
             </tr>
           </thead>
           <tbody>
-            {displayCampaignAnomalies.length === 0 ? (
+            {campaignAnomalies.length === 0 ? (
               <tr>
                 <td colSpan={7}>No major anomalies detected right now.</td>
               </tr>
             ) : (
-              displayCampaignAnomalies.map((row, idx) => (
+              campaignAnomalies.map((row, idx) => (
                 <tr className={row.severity === "high" ? "nc-row-severity-high" : "nc-row-severity-medium"} key={`anomaly-${row.source}-${row.type}-${idx}`}>
                   <td data-label="Source">{row.source}</td>
                   <td data-label="Type">{row.type}</td>
@@ -3676,7 +2764,7 @@ export default function Index() {
         <div className="nc-card nc-section">
           <h2>Attribution Models (Beta)</h2>
           <p className="nc-note">Upgrade to Premium to unlock first-click, linear, and time-decay attribution views.</p>
-          <Link to="/app/pricing" className="nc-chip">Upgrade plan</Link>
+          <Link to="/app/billing?manage=1" className="nc-chip">Upgrade plan</Link>
         </div>
       ) : null}
 
@@ -3723,7 +2811,7 @@ export default function Index() {
         <div id="stop-campaigns" className="nc-card nc-section">
           <h2>Campaigns to Stop Running</h2>
           <p className="nc-note">Upgrade to Pro to unlock campaign stop recommendations and priority signals.</p>
-          <Link to="/app/pricing" className="nc-chip">Upgrade plan</Link>
+          <Link to="/app/billing?manage=1" className="nc-chip">Upgrade plan</Link>
         </div>
       ) : null}
 
@@ -3848,7 +2936,7 @@ export default function Index() {
         <div className="nc-card nc-section">
           <h2>Incrementality Snapshot (Heuristic)</h2>
           <p className="nc-note">Upgrade to Premium to unlock incrementality estimation and cohort-level uplift views.</p>
-          <Link to="/app/pricing" className="nc-chip">Upgrade plan</Link>
+          <Link to="/app/billing?manage=1" className="nc-chip">Upgrade plan</Link>
         </div>
       ) : null}
 
@@ -3913,14 +3001,14 @@ export default function Index() {
             </tr>
           </thead>
           <tbody>
-            {displaySourceBreakdown.length === 0 && (
+            {sourceBreakdown.length === 0 && (
               <tr>
                 <td style={{ padding: "12px" }} colSpan={7}>
                   No source data yet.
                 </td>
               </tr>
             )}
-            {displaySourceBreakdown.map((row) => (
+            {sourceBreakdown.map((row) => (
               <tr key={row.source} style={{ borderBottom: "1px solid #e0e0e0" }}>
                 <td data-label="Source" style={{ padding: "12px", textTransform: "capitalize" }}>{row.source}</td>
                 <td data-label="Orders" style={{ padding: "12px", textAlign: "right" }}>{row.orders}</td>
@@ -3995,9 +3083,6 @@ export default function Index() {
 
       {isSectionVisible("orders") ? <div className="nc-card">
         <h2>Recent Orders</h2>
-        <p className="nc-note" style={{ marginTop: 0 }}>
-          Showing {displayedOrders.length} of {orders.length} orders for this window.
-        </p>
         <table className="nc-table-card nc-sticky-table" style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead>
             <tr style={{ background: "#f5f5f5" }}>
@@ -4020,7 +3105,7 @@ export default function Index() {
                 </td>
               </tr>
             )}
-            {displayedOrders.map((order) => {
+            {orders.map((order) => {
               const isExpanded = expandedOrderId === order.id;
               return (
                 <Fragment key={order.id}>
@@ -4152,24 +3237,6 @@ export default function Index() {
             })}
           </tbody>
         </table>
-        {hasMoreOrders ? (
-          <div className="nc-toolbar" style={{ marginBottom: 0, marginTop: "10px" }}>
-            <button
-              type="button"
-              className="nc-chip"
-              onClick={() => setVisibleOrdersCount((current) => Math.min(orders.length, current + 100))}
-            >
-              Load 100 more
-            </button>
-            <button
-              type="button"
-              className="nc-chip"
-              onClick={() => setVisibleOrdersCount(orders.length)}
-            >
-              Load all visible rows
-            </button>
-          </div>
-        ) : null}
       </div> : null}
 
       {selectedOrder360 ? (
@@ -4315,7 +3382,7 @@ export function ErrorBoundary() {
       <div className="nc-card nc-section">
         <h2>Home Unavailable</h2>
         <p className="nc-note">{message}</p>
-        <a className="nc-chip" href={withEmbedded("/app")}>Reload Home</a>
+        <a className="nc-chip" href="/app">Reload Home</a>
       </div>
     </div>
   );

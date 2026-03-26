@@ -1,7 +1,6 @@
 import { redirect } from "@remix-run/node";
 import { Form, useActionData, useLoaderData, useRouteError, isRouteErrorResponse } from "@remix-run/react";
 import { authenticate, BASIC_PLAN, PRO_PLAN, PREMIUM_PLAN } from "../shopify.server";
-import { resolvePremiumOverrideForShop } from "../utils/plan.server";
 
 const PLAN_DETAILS = {
   [BASIC_PLAN]: {
@@ -9,39 +8,18 @@ const PLAN_DETAILS = {
     label: "Starter",
     monthlyINR: 2000,
     description: "Strong foundation for net-cash analytics + attribution dashboard",
-    features: [
-      "Net cash dashboard + core KPIs",
-      "Campaign performance overview",
-      "Basic alerts and health score",
-      "CSV exports (orders + spend)",
-      "Shopify order sync",
-    ],
   },
   [PRO_PLAN]: {
     key: PRO_PLAN,
     label: "Pro",
     monthlyINR: 5000,
     description: "Advanced campaign analytics + automation rules",
-    features: [
-      "Everything in Starter",
-      "Campaign stop list + actions",
-      "Attribution model comparisons",
-      "RFM cohorts + customer 360",
-      "Scheduled reports",
-    ],
   },
   [PREMIUM_PLAN]: {
     key: PREMIUM_PLAN,
     label: "Premium",
     monthlyINR: 10000,
-    description: "Full growth toolkit with AI workflow + enterprise controls",
-    features: [
-      "Everything in Pro",
-      "Universal Insights + behavior graph",
-      "AI insights assistant",
-      "Advanced connector health + syncs",
-      "Priority support + onboarding",
-    ],
+    description: "Full growth OS with AI workflow + enterprise controls",
   },
 };
 
@@ -62,23 +40,8 @@ function presentPlanName(value) {
 }
 
 export async function loader({ request }) {
-  const { billing, session } = await authenticate.admin(request);
+  const { billing } = await authenticate.admin(request);
   const url = new URL(request.url);
-  const premiumOverride = resolvePremiumOverrideForShop(session?.shop);
-
-  if (premiumOverride) {
-    if (url.searchParams.get("manage") !== "1") {
-      return redirect(`/app${url.search}`);
-    }
-
-    return {
-      plans: Object.values(PLAN_DETAILS),
-      hasActivePayment: true,
-      subscriptions: premiumOverride.subscriptions,
-      isTestMode: process.env.NODE_ENV !== "production",
-    };
-  }
-
   const check = await billing.check({
     plans: [BASIC_PLAN, PRO_PLAN, PREMIUM_PLAN],
     isTest: process.env.NODE_ENV !== "production",
@@ -187,11 +150,6 @@ export default function AppBillingRoute() {
               <span className="nc-note"> / month</span>
             </p>
             <p className="nc-note">{plan.description}</p>
-            <ul style={{ margin: "10px 0 12px", paddingLeft: "18px" }}>
-              {(plan.features || []).map((feature) => (
-                <li key={`${plan.key}-${feature}`}>{feature}</li>
-              ))}
-            </ul>
             <Form method="post">
               <input type="hidden" name="plan" value={plan.key} />
               <button type="submit">{plan.label}</button>

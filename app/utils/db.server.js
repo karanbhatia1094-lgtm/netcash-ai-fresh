@@ -11,8 +11,6 @@ export {
   getSpendEntries,
   updateSpendEntry,
   deleteSpendEntry,
-  upsertCreativeMetricDaily,
-  upsertCreativeMetricBatch,
   getConnectorCredential,
   listConnectorCredentials,
   upsertConnectorCredential,
@@ -54,14 +52,12 @@ export {
   listAudienceSyncRuns,
   runAudienceSyncRules,
   getCreativePerformanceScores,
-  getCreativeFatigueRisks,
   getBudgetReallocationSuggestions,
   createBudgetReallocationDecision,
   listBudgetReallocationDecisions,
   ingestUniversalSignalEvents,
   getUniversalShopOverview,
   getUniversalInsights,
-  listUniversalSources,
 } from "./db.js";
 
 // Re-export for convenience

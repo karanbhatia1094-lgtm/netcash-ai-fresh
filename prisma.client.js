@@ -14,11 +14,7 @@ const prismaOptions =
         }),
       }
     : {
-        datasources: {
-          db: {
-            url: databaseUrl,
-          },
-        },
+        datasourceUrl: databaseUrl,
       };
 
 export const prisma = new PrismaClient(prismaOptions);
