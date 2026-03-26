@@ -2,8 +2,8 @@
 # Use a public HTTPS URL for the hosted staging app.
 
 client_id = "ca00a6ab66f5d61288a89a6a3fabce24"
-name = "netcash-ai-fresh-staging"
-application_url = "https://netcash-web.onrender.com"
+name = "netcash-ai-fresh-local"
+application_url = "http://localhost:3000"
 embedded = true
 
 [build]
@@ -19,4 +19,4 @@ optional_scopes = []
 use_legacy_install_flow = false
 
 [auth]
-redirect_urls = ["https://netcash-web.onrender.com/auth/callback"]
+redirect_urls = ["http://localhost:3000/auth/callback"]
