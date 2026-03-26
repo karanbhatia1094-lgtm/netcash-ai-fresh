@@ -485,6 +485,34 @@ export default function IntegrationsHubPage() {
     <div className="nc-shell">
       <h1>Integration Hub</h1>
       <p className="nc-subtitle">One-click setup for Meta, Google, WhatsApp, Email, SMS, and RCS journeys. Minimal manual work.</p>
+      <div className="nc-toolbar nc-section nc-quick-actions" style={{ marginBottom: 0 }}>
+        <a className="nc-chip" href="#onboarding-wizard">Setup wizard</a>
+        <a className="nc-chip" href="#next-best-action">Next action</a>
+        <Link to="/app/campaigns" className="nc-chip">Go to campaigns</Link>
+      </div>
+      <div className="nc-card nc-section nc-first-value">
+        <div className="nc-section-head-inline">
+          <h3 style={{ margin: 0 }}>First‑value flow</h3>
+          <a className="nc-help-link" href="/app/campaigns">Why this helps</a>
+        </div>
+        <ol className="nc-step-list">
+          <li>
+            <strong>Connect ad platforms</strong>
+            <span>Meta + Google unlock source‑level ROI.</span>
+            <a className="nc-chip" href="#onboarding-wizard">Connect now</a>
+          </li>
+          <li>
+            <strong>Auto‑setup channels</strong>
+            <span>Create destinations + rules automatically.</span>
+            <a className="nc-chip" href="#onboarding-wizard">Auto‑setup</a>
+          </li>
+          <li>
+            <strong>Run health checks</strong>
+            <span>Validate sync before scaling spend.</span>
+            <a className="nc-chip" href="#next-best-action">Run checks</a>
+          </li>
+        </ol>
+      </div>
       {oauthError ? <p className="nc-danger">{oauthError}</p> : null}
       {oauth ? <p className="nc-note" style={{ color: "#0d6e4f", fontWeight: 700 }}>Connected: {oauth}</p> : null}
       {!connectorActionsEnabled ? (
@@ -502,7 +530,7 @@ export default function IntegrationsHubPage() {
         <div className="nc-kpi-card"><div className="nc-muted">Connector Actions</div><div className="nc-kpi-value">{connectorActionsEnabled ? "Enabled" : "Disabled"}</div></div>
       </div>
 
-      <div className="nc-card nc-section nc-glass nc-next-action" style={{ marginTop: "12px" }}>
+      <div className="nc-card nc-section nc-glass nc-next-action" id="next-best-action" style={{ marginTop: "12px" }}>
         <h2 style={{ marginBottom: "8px" }}>Next Best Action</h2>
         <p className="nc-note" style={{ marginBottom: "8px" }}>
           <strong>{nextAction.label}</strong>. {nextAction.hint}
@@ -516,7 +544,7 @@ export default function IntegrationsHubPage() {
         ) : null}
       </div>
 
-      <div className="nc-card nc-section nc-glass" style={{ marginTop: "14px" }}>
+      <div className="nc-card nc-section nc-glass" id="onboarding-wizard" style={{ marginTop: "14px" }}>
         <h2>Post-Install Onboarding Wizard</h2>
         <p className="nc-note">Progress: {progressPct}% complete. Only missing tasks are shown below.</p>
         <div style={{ height: "8px", borderRadius: "999px", background: "#e7eef9", overflow: "hidden", marginBottom: "10px" }}>

@@ -246,8 +246,47 @@ export default function IntelligenceStudioPage() {
     <div className="nc-shell">
       <h1>Intelligence Studio</h1>
       <p className="nc-subtitle">UTM quality, behavior timing, repeat windows, and action-ready recommendations for {shop}.</p>
-
+      <div className="nc-toolbar nc-section nc-quick-actions" style={{ marginBottom: 0 }}>
+        <Link to="/app/intelligence#utm-quality" className="nc-chip">UTM quality</Link>
+        <Link to="/app/intelligence#behavior-timing" className="nc-chip">Behavior timing</Link>
+        <Link to="/app/campaigns" className="nc-chip">Apply to campaigns</Link>
+      </div>
+      <div className="nc-card nc-section nc-first-value">
+        <div className="nc-section-head-inline">
+          <h3 style={{ margin: 0 }}>First‑value flow</h3>
+          <a className="nc-help-link" href="/app/campaigns">Why this helps</a>
+        </div>
+        <ol className="nc-step-list">
+          <li>
+            <strong>Fix attribution gaps</strong>
+            <span>Start with unmapped orders and low UTM coverage.</span>
+            <a className="nc-chip" href="#utm-quality">View gaps</a>
+          </li>
+          <li>
+            <strong>Pick timing window</strong>
+            <span>Use top hours to schedule pushes.</span>
+            <a className="nc-chip" href="#behavior-timing">Open timing</a>
+          </li>
+          <li>
+            <strong>Action recommendations</strong>
+            <span>Apply next actions in Campaigns.</span>
+            <Link to="/app/campaigns" className="nc-chip">Go to campaigns</Link>
+          </li>
+        </ol>
+      </div>
       <div className="nc-card nc-section nc-glass">
+        <div className="nc-section-head-inline">
+          <h3 style={{ margin: 0 }}>Suggested questions</h3>
+          <span className="nc-note">Use these to guide your review</span>
+        </div>
+        <div className="nc-toolbar" style={{ marginBottom: 0 }}>
+          <span className="nc-chip">Where are UTMs missing?</span>
+          <span className="nc-chip">Which hours convert best?</span>
+          <span className="nc-chip">Which sources need click IDs?</span>
+        </div>
+      </div>
+
+      <div className="nc-card nc-section nc-glass" id="utm-quality">
         <h2>Attribution Quality</h2>
         <div className="nc-kpi-grid">
           <div className="nc-kpi-card"><div className="nc-muted">Orders with Any UTM</div><div className="nc-kpi-value">{utm.anyUtm} ({pct(utm.anyUtmPct)})</div></div>
@@ -318,7 +357,7 @@ export default function IntelligenceStudioPage() {
         </table>
       </div>
 
-      <div className="nc-card nc-section nc-glass">
+      <div className="nc-card nc-section nc-glass" id="behavior-timing">
         <h2>Behavior & Timing Intelligence</h2>
         <div className="nc-grid-4">
           <div className="nc-soft-box"><strong>Best Paid Ad Conversion Hour</strong><p style={{ marginBottom: 0 }}>{behavior.bestPaidHour?.label || "Not enough data"}</p></div>

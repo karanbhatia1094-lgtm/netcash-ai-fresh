@@ -124,9 +124,37 @@ export default function UniversalInsightsPage() {
 
   return (
     <div className="nc-shell">
-      <div className="nc-card nc-section nc-glass">
+      <div className="nc-card nc-section nc-glass" id="hourly-pattern">
         <h1>Universal Insights</h1>
         <p className="nc-subtitle">Cross-store customer behavior graph for last {days} days.</p>
+        <div className="nc-toolbar nc-section nc-quick-actions" style={{ marginBottom: 0 }}>
+          <Link to="/app/universal#customer-segments" className="nc-chip">Customer segments</Link>
+          <Link to="/app/universal#hourly-pattern" className="nc-chip">Best hours</Link>
+          <Link to="/app/campaigns" className="nc-chip">Apply to campaigns</Link>
+        </div>
+        <div className="nc-card nc-section nc-first-value">
+          <div className="nc-section-head-inline">
+            <h3 style={{ margin: 0 }}>First‑value flow</h3>
+            <a className="nc-help-link" href="/app/campaigns">Why this helps</a>
+          </div>
+          <ol className="nc-step-list">
+            <li>
+              <strong>Pick a segment</strong>
+              <span>Start with Champions or At‑risk cohorts.</span>
+              <a className="nc-chip" href="#customer-segments">Open segments</a>
+            </li>
+            <li>
+              <strong>Choose channel</strong>
+              <span>Use payment + device patterns to tailor creative.</span>
+              <a className="nc-chip" href="#payment-patterns">Review patterns</a>
+            </li>
+            <li>
+              <strong>Activate campaign</strong>
+              <span>Send the segment to Campaigns for action.</span>
+              <Link to="/app/campaigns" className="nc-chip">Go to campaigns</Link>
+            </li>
+          </ol>
+        </div>
         <div className="nc-toolbar" style={{ marginBottom: "10px" }}>
           {[30, 60, 90, 180].map((option) => (
             <Link key={option} to={dayQuery(option)} className={`nc-chip ${days === option ? "is-active" : ""}`}>
@@ -212,7 +240,7 @@ export default function UniversalInsightsPage() {
         </div>
       </div>
 
-      <div className="nc-card nc-section nc-glass">
+      <div className="nc-card nc-section nc-glass" id="payment-patterns">
         <h2>Top Payment and Coupon Patterns</h2>
         <div className="nc-grid-4">
           <div className="nc-soft-box">

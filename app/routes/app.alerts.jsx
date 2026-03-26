@@ -259,6 +259,34 @@ export default function AlertsPage() {
       ) : null}
       <h1>Alerts Center</h1>
       <p className="nc-subtitle">Auto-detected anomalies based on net cash, ROAS, spend and order trends.</p>
+      <div className="nc-toolbar nc-section nc-quick-actions" style={{ marginBottom: 0 }}>
+        <Link to="/app/alerts#alert-events" preventScrollReset className="nc-chip">Review latest alerts</Link>
+        <Link to="/app/campaigns#campaign-stop-list" preventScrollReset className="nc-chip">Fix low ROAS</Link>
+        <Link to="/app/integrations?wizard=1" preventScrollReset className="nc-chip">Check connectors</Link>
+      </div>
+      <div className="nc-card nc-section nc-first-value">
+        <div className="nc-section-head-inline">
+          <h3 style={{ margin: 0 }}>First‑value flow</h3>
+          <a className="nc-help-link" href="/app/campaigns">Why this helps</a>
+        </div>
+        <ol className="nc-step-list">
+          <li>
+            <strong>Open critical unread</strong>
+            <span>Resolve the highest impact alerts first.</span>
+            <Link to="/app/alerts?severity=critical" preventScrollReset className="nc-chip">View critical</Link>
+          </li>
+          <li>
+            <strong>Apply the fix</strong>
+            <span>Jump to campaigns or connectors to resolve root cause.</span>
+            <Link to="/app/campaigns" preventScrollReset className="nc-chip">Review campaigns</Link>
+          </li>
+          <li>
+            <strong>Save a report</strong>
+            <span>Share a daily alert snapshot.</span>
+            <a className="nc-chip" href="#alerts-reports">Save report</a>
+          </li>
+        </ol>
+      </div>
       <p className="nc-note" style={{ marginTop: "-8px" }}>
         Need period-to-period movement? Review <a href="/app?compare=1">Home Compare Mode</a>.
       </p>
@@ -317,13 +345,29 @@ export default function AlertsPage() {
           </div>
         </div>
       ) : null}
-      <div className="nc-card nc-section nc-glass">
+      <div className="nc-card nc-section nc-glass" id="alerts-reports">
         <div className="nc-section-head-inline">
           <h2>Saved Reports & Scheduled Export</h2>
           <div className="nc-toolbar" style={{ marginBottom: 0 }}>
             <button type="button" className="nc-chip" onClick={saveReport}>Save Report</button>
             <button type="button" className="nc-chip" onClick={scheduleExport}>Schedule Export</button>
           </div>
+        </div>
+        <div className="nc-toolbar" style={{ marginBottom: "10px" }}>
+          <button
+            type="button"
+            className="nc-chip"
+            onClick={() => setReportDraft((c) => ({ ...c, name: "Daily Alert Snapshot", frequency: "daily" }))}
+          >
+            Daily template
+          </button>
+          <button
+            type="button"
+            className="nc-chip"
+            onClick={() => setReportDraft((c) => ({ ...c, name: "Weekly Risk Review", frequency: "weekly" }))}
+          >
+            Weekly template
+          </button>
         </div>
         <div className="nc-grid-4">
           <label className="nc-form-field">Report Name

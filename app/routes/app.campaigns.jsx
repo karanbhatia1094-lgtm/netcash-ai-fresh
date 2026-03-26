@@ -353,6 +353,35 @@ export default function CampaignsPage() {
       <p className="nc-subtitle">
         Compare campaign quality using gross revenue, net cash, ROAS <span className="nc-tip-icon" title="Revenue divided by ad spend.">?</span>, and Real ROAS <span className="nc-tip-icon" title="Net-cash aware ROAS after returns and cost impact.">?</span>.
       </p>
+      <div className="nc-toolbar nc-section nc-quick-actions" style={{ marginBottom: 0 }}>
+        <Link to="/app/campaigns#campaign-stop-list" preventScrollReset className="nc-chip">Review stop list</Link>
+        <Link to="/app/campaigns#budget-reallocation" preventScrollReset className="nc-chip">Reallocate budget</Link>
+        <Link to="/app/integrations?wizard=1" preventScrollReset className="nc-chip">Connect sources</Link>
+        <Link to="/app/campaigns#campaign-table" preventScrollReset className="nc-chip">All campaigns</Link>
+      </div>
+      <div className="nc-card nc-section nc-first-value">
+        <div className="nc-section-head-inline">
+          <h3 style={{ margin: 0 }}>First‑value flow</h3>
+          <a className="nc-help-link" href="/app/integrations?wizard=1">Why this helps</a>
+        </div>
+        <ol className="nc-step-list">
+          <li>
+            <strong>Open stop list</strong>
+            <span>Identify the first 3 campaigns to pause.</span>
+            <Link to="/app/campaigns#campaign-stop-list" preventScrollReset className="nc-chip">Open list</Link>
+          </li>
+          <li>
+            <strong>Queue actions</strong>
+            <span>Add low ROAS campaigns to the action queue.</span>
+            <Link to="/app/campaigns#campaign-table" preventScrollReset className="nc-chip">Queue actions</Link>
+          </li>
+          <li>
+            <strong>Save a report</strong>
+            <span>Export a snapshot for your daily standup.</span>
+            <a className="nc-chip" href="#campaign-reports">Save report</a>
+          </li>
+        </ol>
+      </div>
       {connectorSnapshotFallback?.lastFailedAt ? (
         <div className="nc-card nc-section">
           <h3 style={{ marginTop: 0 }}>Support-Safe Fallback Active</h3>
@@ -506,13 +535,29 @@ export default function CampaignsPage() {
           <div key={k} className="nc-inline-feedback">{rowFeedback[k]}</div>
         ))}
       </div>
-      <div className="nc-card nc-section nc-glass">
+      <div className="nc-card nc-section nc-glass" id="campaign-reports">
         <div className="nc-section-head-inline">
           <h2>Saved Reports & Scheduled Export</h2>
           <div className="nc-toolbar" style={{ marginBottom: 0 }}>
             <button type="button" className="nc-chip" onClick={saveReport}>Save Report</button>
             <button type="button" className="nc-chip" onClick={scheduleExport}>Schedule Export</button>
           </div>
+        </div>
+        <div className="nc-toolbar" style={{ marginBottom: "10px" }}>
+          <button
+            type="button"
+            className="nc-chip"
+            onClick={() => setReportDraft((c) => ({ ...c, name: "Daily Campaign Triage", frequency: "daily" }))}
+          >
+            Daily triage template
+          </button>
+          <button
+            type="button"
+            className="nc-chip"
+            onClick={() => setReportDraft((c) => ({ ...c, name: "Weekly ROAS Summary", frequency: "weekly" }))}
+          >
+            Weekly ROAS template
+          </button>
         </div>
         <div className="nc-grid-4">
           <label className="nc-form-field">Report Name

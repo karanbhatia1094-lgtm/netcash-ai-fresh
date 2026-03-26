@@ -96,6 +96,34 @@ export default function AutopilotPage() {
       <p className="nc-subtitle">
         Confidence-scored throttle/scale recommendations for {data.shop}. Start with dry run, then apply on high-confidence windows.
       </p>
+      <div className="nc-toolbar nc-section nc-quick-actions" style={{ marginBottom: 0 }}>
+        <a className="nc-chip" href="#autopilot-run">Run guardrails</a>
+        <a className="nc-chip" href="#autopilot-recommendations">Review recommendations</a>
+        <a className="nc-chip" href="/app/campaigns">Campaign actions</a>
+      </div>
+      <div className="nc-card nc-section nc-first-value">
+        <div className="nc-section-head-inline">
+          <h3 style={{ margin: 0 }}>First‑value flow</h3>
+          <a className="nc-help-link" href="/app/campaigns">Why this helps</a>
+        </div>
+        <ol className="nc-step-list">
+          <li>
+            <strong>Run a dry run</strong>
+            <span>See recommendations without applying changes.</span>
+            <a className="nc-chip" href="#autopilot-run">Run now</a>
+          </li>
+          <li>
+            <strong>Review decisions</strong>
+            <span>Pick 2–3 high‑confidence actions.</span>
+            <a className="nc-chip" href="#autopilot-recommendations">Review</a>
+          </li>
+          <li>
+            <strong>Create rollbacks</strong>
+            <span>Add rollback actions for safety.</span>
+            <a className="nc-chip" href="#autopilot-recommendations">Add rollback</a>
+          </li>
+        </ol>
+      </div>
 
       <div className="nc-grid-3">
         <div className="nc-kpi-card">
@@ -112,7 +140,7 @@ export default function AutopilotPage() {
         </div>
       </div>
 
-      <div className="nc-card nc-section" style={{ marginTop: "14px" }}>
+      <div className="nc-card nc-section" id="autopilot-run" style={{ marginTop: "14px" }}>
         <h2>Run Guardrails</h2>
         <Form method="post" className="nc-form-row">
           <label className="nc-form-field">
@@ -213,7 +241,7 @@ export default function AutopilotPage() {
         )}
       </div>
 
-      <div className="nc-card nc-section" style={{ marginTop: "14px" }}>
+      <div className="nc-card nc-section" id="autopilot-recommendations" style={{ marginTop: "14px" }}>
         <h2>Recommendations</h2>
         {actionData?.rollbackCreated ? (
           <p className="nc-success">Rollback action item created (ID: {String(actionData.rollbackActionId)}).</p>
